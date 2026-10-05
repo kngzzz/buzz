@@ -38,6 +38,10 @@ export class FakeRelay {
   swallowOk: ((event: NostrEvent) => boolean) | undefined;
   /** Close REQs for which this returns a reason instead of answering them. */
   failQuery: ((filters: readonly Filter[]) => string | undefined) | undefined;
+  /** Hold a REQ's stored events and EOSE until the returned promise settles. */
+  holdQuery:
+    | ((filters: readonly Filter[]) => Promise<void> | undefined)
+    | undefined;
   /** Every valid EVENT a client sent, duplicates included. */
   readonly received: NostrEvent[] = [];
 
@@ -87,6 +91,8 @@ export class FakeRelay {
     visibility?: "open" | "private";
     type?: "stream" | "forum" | "dm";
     members: readonly string[];
+    /** `created_at` of both events; a later value replaces an earlier channel state. */
+    at?: number;
   }): string {
     const id = options.id ?? randomUUID();
     const tags: string[][] = [
@@ -104,20 +110,22 @@ export class FakeRelay {
       kind: Kind.ChannelMetadata,
       tags,
       content: "",
+      ...(options.at === undefined ? {} : { created_at: options.at }),
     });
-    this.setMembers(id, options.members);
+    this.setMembers(id, options.members, options.at);
     return id;
   }
 
-  setMembers(channelId: string, members: readonly string[]): NostrEvent {
+  setMembers(
+    channelId: string,
+    members: readonly string[],
+    at?: number,
+  ): NostrEvent {
     return this.inject(this.relaySigner, {
       kind: Kind.ChannelMembers,
-      tags: [
-        ["d", channelId],
-        ["h", channelId],
-        ...members.map((member) => ["p", member]),
-      ],
+      tags: [["d", channelId], ...members.map((member) => ["p", member])],
       content: "",
+      ...(at === undefined ? {} : { created_at: at }),
     });
   }
 
@@ -140,6 +148,16 @@ export class FakeRelay {
         },
       });
     });
+  }
+
+  /** End every live subscription with CLOSED, as the relay does under load or on revoked access. */
+  closeSubscriptions(reason: string): void {
+    for (const connection of this.#connections) {
+      for (const subId of connection.subs.keys()) {
+        connection.socket.send(JSON.stringify(["CLOSED", subId, reason]));
+      }
+      connection.subs.clear();
+    }
   }
 
   /** Drop every connection, as a relay restart or network blip would. */
@@ -196,15 +214,25 @@ export class FakeRelay {
           send(["CLOSED", subId, failure]);
           return;
         }
-        for (const filter of filters) {
-          let matching = this.#events.filter((event) => matches(filter, event));
-          matching.sort((a, b) => b.created_at - a.created_at);
-          if (filter.limit !== undefined)
-            matching = matching.slice(0, filter.limit);
-          for (const event of matching) send(["EVENT", subId, event]);
-        }
-        send(["EOSE", subId]);
-        connection.subs.set(subId, filters);
+        const answer = () => {
+          for (const filter of filters) {
+            let matching = this.#events.filter((event) =>
+              matches(filter, event),
+            );
+            // Newest first, ties by id, as the relay's `ORDER BY created_at DESC, id ASC`.
+            matching.sort(
+              (a, b) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1),
+            );
+            if (filter.limit !== undefined)
+              matching = matching.slice(0, filter.limit);
+            for (const event of matching) send(["EVENT", subId, event]);
+          }
+          send(["EOSE", subId]);
+          connection.subs.set(subId, filters);
+        };
+        const hold = this.holdQuery?.(filters);
+        if (hold === undefined) answer();
+        else void hold.then(answer);
         return;
       }
       case "CLOSE":
@@ -284,11 +312,21 @@ function matches(filter: Filter, event: NostrEvent): boolean {
   for (const name of ["h", "p", "e", "d"] as const) {
     const wanted = filter[`#${name}`];
     if (wanted === undefined) continue;
+    const values = event.tags.flatMap((tag) =>
+      tag[0] === name && tag[1] !== undefined ? [tag[1]] : [],
+    );
+    // Like the relay: an event without `h` tags matches `#h` by the channel it
+    // is stored under, which for channel metadata and member lists is `d`.
+    const channel =
+      name === "h" &&
+      values.length === 0 &&
+      (event.kind === Kind.ChannelMetadata ||
+        event.kind === Kind.ChannelMembers)
+        ? event.tags.find((tag) => tag[0] === "d")?.[1]
+        : undefined;
     if (
-      !event.tags.some(
-        (tag) =>
-          tag[0] === name && tag[1] !== undefined && wanted.includes(tag[1]),
-      )
+      !values.some((value) => wanted.includes(value)) &&
+      (channel === undefined || !wanted.includes(channel))
     ) {
       return false;
     }

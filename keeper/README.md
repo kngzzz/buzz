@@ -20,18 +20,24 @@ Phase 0 and most of Phase 1a/1b of the spec (§16) work against a real relay:
 - Thread context: the thread so far when Keeper is first asked, later messages
   as context, and edits and deletions applied to what the model sees.
 - Research jobs that run in the background and post one report in the thread.
-- Tools: `read_thread`, `search_messages`, `web_fetch` (refuses private
-  addresses), `web_search` (with a Brave Search key), `research`.
+- Tools: `read_thread`, `search_messages`, `research`, and in open channels
+  only, `web_fetch` (refuses private addresses) and `web_search` (with a Brave
+  Search key). Conversations of private channels and DMs never reach the web.
 - `@Keeper status` and `@Keeper stop`.
 - One durable store per audience (open channels, each private channel, each
   DM); reads and posts pass the information-flow checks of the
   [information-flow draft](../docs/practical-information-flow-for-buzz-agents.md).
+  When a channel changes visibility, its threads move to the new audience.
 - Exactly-once replies across crashes; failed events are retried from a durable
   record, and Keeper says so in the thread if it gives up.
 
 Not yet built: MCP servers, skills, budgets, resident deployment, the
 crash-injection suite, and epoch rotation when a private channel's membership
 narrows. See the spec for the full list.
+
+Known gap: a deleted or edited message is removed from what the model sees,
+but copies of it in earlier tool results (`read_thread`, `search_messages`)
+stay in that conversation's context.
 
 ## Try it in demo mode
 
@@ -105,15 +111,16 @@ relay ──► RelayClient ──► Keeper (service) ──► router ──�
                                 │                              │
                                 └── ControlStore               ├── thread conversations
                                     (cursors, threads,         ├── reply tasks ──► Broker ──► relay
-                                     retries, handled)         └── research conversations + reporters
+                                     messages, retries,        └── research conversations + reporters
+                                     controls)
 ```
 
 | Path | Role |
 |---|---|
-| `src/relay/client.ts` | One NIP-01/NIP-42 connection: auth, subscriptions re-sent after reconnect, queries, publishes that wait for `OK` |
-| `src/service/keeper.ts` | The service: channel discovery and membership, per-thread queues, requests, context, edits, control commands, retries |
+| `src/relay/client.ts` | One NIP-01/NIP-42 connection: auth, subscriptions re-sent after reconnects and passing refusals, paged queries, publishes that wait for `OK` |
+| `src/service/keeper.ts` | The service: channel discovery and membership, ordered catch-up, per-thread queues, requests, context, edits, control commands, retries, idle domains |
 | `src/service/router.ts` | Pure decision for each relay event: request, context, control, edit, deletion, or ignore |
-| `src/service/control.ts` | Process-wide SQLite: replay cursors (900 s overlap), thread index, retry records, handled control commands |
+| `src/service/control.ts` | Process-wide SQLite: replay cursors (900 s overlap), thread and message indexes, retry records, control commands carried out |
 | `src/service/reply-task.ts`, `publish.ts` | Durable reply task: waits for the answer, then publishes memoized signed events exactly once |
 | `src/broker/` | The only holder of the key; reader sets from relay-signed metadata; read and publish checks |
 | `src/runtime/` | Domains (one pi-durable Harness per audience), durable documents, message rendering |
@@ -126,17 +133,20 @@ Guarantees and where they come from:
 - **Exactly one reply per request.** Each request gets a background reply task.
   The task memoizes the signed event before publishing it, so a rerun after a
   crash publishes the same event id and the relay deduplicates it.
-- **Nothing missed across restarts.** Each channel's cursor replays from 900
-  seconds before the last processed event — the relay accepts timestamps up to
-  900 seconds from its clock. Every effect is idempotent by event id: requests,
-  context and edits through pi-durable request ids, control commands through
-  the control store.
+- **Nothing missed across restarts.** Each channel's cursor stays below any
+  event still being handled, and replays start 900 seconds before it — the
+  relay accepts timestamps up to 900 seconds from its clock. Missed events are
+  paged in past the relay's page limit and handled oldest first. Every effect
+  is idempotent by event id: requests, context and edits through pi-durable
+  request ids, control commands through the control store.
 - **Failures are retried, then reported.** An event whose handling fails is
   recorded with a backoff and retried, also after a restart. After the last
-  attempt, Keeper tells the thread it could not take the request.
+  attempt, Keeper tells the thread it could not take the request. A reply or
+  report the relay refuses for good is recorded as failed, never lost.
 - **Audience isolation.** Open channels share one store; each private channel
   and each DM has its own. A conversation can only read content its audience
-  may see and only post where its audience may read.
+  may see and only post where its audience may read. Channel facts come only
+  from relay-signed metadata, applied newest first as they change.
 
 ## Development
 

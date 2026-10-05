@@ -28,6 +28,11 @@ export type Audience = {
  */
 export class Directory {
   readonly #channels = new Map<string, ChannelInfo>();
+  /** Newest applied event per kind and channel; replays and reconnects deliver older ones too. */
+  readonly #versions = new Map<
+    string,
+    { readonly createdAt: number; readonly id: string }
+  >();
 
   get(channelId: string): ChannelInfo | undefined {
     return this.#channels.get(channelId);
@@ -39,12 +44,33 @@ export class Directory {
 
   delete(channelId: string): void {
     this.#channels.delete(channelId);
+    this.#versions.delete(`${Kind.ChannelMetadata}:${channelId}`);
+    this.#versions.delete(`${Kind.ChannelMembers}:${channelId}`);
   }
 
-  /** Apply a kind 39000 or 39002 event; returns the channel it changed. */
+  /**
+   * Apply a kind 39000 or 39002 event; returns the channel it changed, or
+   * `undefined` for an event older than the one already applied. Newest wins,
+   * and the lowest id breaks a tie, as for any NIP-01 replaceable event.
+   */
   apply(event: NostrEvent): ChannelInfo | undefined {
     const id = tagValue(event, "d");
     if (id === undefined) return undefined;
+    if (
+      event.kind !== Kind.ChannelMetadata &&
+      event.kind !== Kind.ChannelMembers
+    )
+      return undefined;
+    const key = `${event.kind}:${id}`;
+    const applied = this.#versions.get(key);
+    if (
+      applied !== undefined &&
+      (event.created_at < applied.createdAt ||
+        (event.created_at === applied.createdAt && event.id >= applied.id))
+    ) {
+      return undefined;
+    }
+    this.#versions.set(key, { createdAt: event.created_at, id: event.id });
     const current = this.#channels.get(id) ?? {
       id,
       name: id,
@@ -53,17 +79,13 @@ export class Directory {
       archived: false,
       members: new Set<string>(),
     };
-    let next: ChannelInfo;
-    if (event.kind === Kind.ChannelMetadata) {
-      next = { ...current, ...parseMetadata(event) };
-    } else if (event.kind === Kind.ChannelMembers) {
-      next = {
-        ...current,
-        members: new Set(tagValues(event, "p").map((p) => p.toLowerCase())),
-      };
-    } else {
-      return undefined;
-    }
+    const next: ChannelInfo =
+      event.kind === Kind.ChannelMetadata
+        ? { ...current, ...parseMetadata(event) }
+        : {
+            ...current,
+            members: new Set(tagValues(event, "p").map((p) => p.toLowerCase())),
+          };
     this.#channels.set(id, next);
     return next;
   }

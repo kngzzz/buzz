@@ -16,6 +16,7 @@ import {
   BindingDoc,
   type BuzzMessageData,
   BuzzMessageEntry,
+  HistoryDoc,
   ThreadDoc,
   type ThreadState,
 } from "./docs.ts";
@@ -117,11 +118,13 @@ export class Domain {
           init: async (tx, id) => {
             Object.assign(await tx.doc(ThreadDoc, id), thread);
             (await tx.doc(BindingDoc, threadKey, null)).conversationId = id;
+            const history = await tx.doc(HistoryDoc, id);
             for (const entry of entries) {
-              await tx.appendEntry(BuzzMessageEntry, id, {
+              const record = await tx.appendEntry(BuzzMessageEntry, id, {
                 model: [...entry.model],
                 data: entry.data,
               });
+              history.entries[entry.data.eventId] = record.id;
             }
           },
         },

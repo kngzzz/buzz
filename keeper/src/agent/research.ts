@@ -13,7 +13,7 @@ import { Kind, nowSeconds, replyTags } from "../nostr/event.ts";
 import { REPORT_TAG, RequestsDoc, ThreadDoc } from "../runtime/docs.ts";
 import { assistantText, chunkText } from "../runtime/render.ts";
 import { publishOnce } from "../service/publish.ts";
-import type { AgentServices } from "./services.ts";
+import { type AgentServices, mayUseWeb } from "./services.ts";
 
 export type ResearchJob = {
   question: string;
@@ -79,20 +79,29 @@ type ReporterState =
       readonly status: "posted" | "failed" | "stopped";
     };
 
-const WORKER_INSTRUCTIONS = [
-  "You are a research worker. Investigate the question thoroughly but efficiently.",
-  "Search the web, read the most relevant sources, and check what the team already discussed in Buzz with search_messages.",
+/** A worker's instructions; without the web, it researches what the team discussed in Buzz. */
+function workerInstructions(web: boolean): string {
+  return [
+    "You are a research worker. Investigate the question thoroughly but efficiently.",
+    web
+      ? "Search the web, read the most relevant sources, and check what the team already discussed in Buzz with search_messages."
+      : "You have no web access here, because this conversation is private. Research what the team already discussed in Buzz with search_messages and read_thread, and say what would need outside sources.",
+    ...REPORT_FORMAT,
+  ].join("\n");
+}
+
+const REPORT_FORMAT = [
   "Then write the final report in Markdown:",
   "**Summary**: one short paragraph that answers the question.",
   "**Findings**: bullets, each citing its sources as links.",
   "**Open questions**: what you could not establish.",
   "Stay under 700 words, and state only what your sources support.",
   "Your final message is posted to the team as the report, so do not address it to anyone in particular.",
-].join("\n");
+];
 
 export function researchExtension(
   services: AgentServices,
-  workerExtensions: () => readonly Extension[],
+  workerExtensions: (domain: string) => readonly Extension[],
 ): Extension {
   const reporter = defineTask<ReporterInput, ReporterState, null>({
     name: "keeper.research-reporter",
@@ -163,7 +172,8 @@ export function researchExtension(
         }, context);
       },
       post: async (task, runtime, context) => {
-        const { text, status } = task.state.checkpoint;
+        const { text } = task.state.checkpoint;
+        let { status } = task.state.checkpoint;
         const thread = await runtime.snapshot(
           ThreadDoc,
           runtime.conversationId,
@@ -175,7 +185,7 @@ export function researchExtension(
               ? `📋 **Research report:** ${task.input.question}\n\n`
               : "";
           const parent = task.input.replyTo ?? thread.root;
-          await publishOnce(
+          const outcome = await publishOnce(
             runtime,
             services.broker,
             {
@@ -200,6 +210,13 @@ export function researchExtension(
             })),
             context,
           );
+          if (!outcome.ok) {
+            status = "failed";
+            services.log.error("research report not delivered", {
+              jobId: task.input.jobId,
+              reason: outcome.reason,
+            });
+          }
         }
         await runtime.commit(async (tx) => {
           const job = (await tx.doc(ResearchJobsDoc, runtime.conversationId))
@@ -281,8 +298,8 @@ export function researchExtension(
           ...(services.researchModel === undefined
             ? {}
             : { model: services.researchModel }),
-          extensions: workerExtensions(),
-          instructions: WORKER_INSTRUCTIONS,
+          extensions: workerExtensions(thread.domain),
+          instructions: workerInstructions(mayUseWeb(thread.domain)),
         });
         Object.assign(await tx.doc(ThreadDoc, child.id), thread);
         const reporterTaskId = await tx.createTask(

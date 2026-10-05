@@ -1661,9 +1661,9 @@ of milestones 1a and 1b, verified against a local relay; its
 exactly one reply per mention, also when the process is killed and restarted,
 and the label fixtures pass in Rust and TypeScript. The outbox is a durable
 reply task per request that memoizes its signed events. Still open in Phase 1:
-reconciliation sweeps, NIP-FI-aware reconnect, suspending idle domains, the
-epoch rule on narrowing, compaction, progress messages, MCP, skills, forum
-reports, budgets, and all of 1c.
+reconciliation sweeps, NIP-FI-aware reconnect, the epoch rule on narrowing,
+compaction, progress messages, MCP, skills, forum reports, budgets, and all of
+1c.
 
 Why research comes first:
 

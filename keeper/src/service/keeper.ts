@@ -6,11 +6,12 @@ import type { Models, UserMessage } from "@earendil-works/pi-ai";
 import {
   type Conversation,
   type ConversationId,
-  type EntryRecord,
+  type EntryId,
   type HarnessSettings,
   InboxDoc,
   LiveDoc,
   type ModelRef,
+  type SubmissionId,
   UsageDoc,
 } from "@earendil-works/pi-durable";
 import { buildAgent, type KeeperAgent } from "../agent/agent.ts";
@@ -23,6 +24,7 @@ import { safeFetch } from "../net/safe-fetch.ts";
 import {
   CHANNEL_KINDS,
   channelOf,
+  type Filter,
   Kind,
   MESSAGE_KINDS,
   type NostrEvent,
@@ -34,16 +36,34 @@ import type { Signer } from "../nostr/signer.ts";
 import { RelayClient } from "../relay/client.ts";
 import {
   BuzzMessageEntry,
+  HistoryDoc,
   RequestsDoc,
   type ThreadState,
 } from "../runtime/docs.ts";
 import { Domain, type HistoryEntry } from "../runtime/domain.ts";
 import { renderMessage } from "../runtime/render.ts";
 import { ControlStore } from "./control.ts";
-import { type Route, route, type ThreadRef, threadOf } from "./router.ts";
+import {
+  type Control,
+  type Route,
+  route,
+  type ThreadRef,
+  threadOf,
+} from "./router.ts";
 
 /** Attempts at handling one event before Keeper gives up and tells the thread. */
 const MAX_ATTEMPTS = 6;
+/** Attempts at that last notice before the event is dropped with an error log. */
+const MAX_APOLOGY_ATTEMPTS = 3;
+/**
+ * Stored events per page when catching up. The relay's own limit is 1,000, so
+ * a page this size coming back full means older events may be waiting.
+ */
+const CATCH_UP_PAGE = 500;
+/** A domain with nothing live is closed after this long without use. */
+const DOMAIN_IDLE_MS = 10 * 60 * 1000;
+/** Research jobs listed by `status`, newest first. */
+const STATUS_JOBS = 5;
 
 export type KeeperOptions = {
   readonly relayUrl: string;
@@ -69,6 +89,9 @@ export type KeeperOptions = {
   readonly retryBaseMs?: number;
 };
 
+/** What a queued event is for: handling it, or the last notice after handling kept failing. */
+type Mode = "handle" | "apologize";
+
 /**
  * The research agent service: connects to one community's relay, listens in
  * the channels Keeper belongs to, turns requests into durable conversations,
@@ -83,16 +106,26 @@ export class Keeper {
   readonly #agent: KeeperAgent;
   readonly #control: ControlStore;
   readonly #domains = new Map<string, Promise<Domain>>();
+  /** Domains being closed; reopening one waits for its close. */
+  readonly #closing = new Map<string, Promise<void>>();
+  readonly #lastUsed = new Map<string, number>();
   readonly #seen = new BoundedSet(20_000);
-  /** Recent message id → thread key, for edits and deletions (deleted events can no longer be queried). */
+  /** Recent message id → thread key, so an edit queues behind the message it changes. */
   readonly #messageThreads = new BoundedMap<string, string>(50_000);
   readonly #queues = new Map<string, Promise<void>>();
-  /** Events with a retry record, so success clears it. */
-  readonly #retrying = new Set<string>();
+  /** Per channel: events taken but not settled (id → `created_at`); the cursor stays below them. */
+  readonly #inflight = new Map<string, Map<string, number>>();
+  /** Per channel: the newest settled event, the cursor's next mark when nothing older is in flight. */
+  readonly #settledMarks = new Map<string, number>();
+  readonly #dirtyCursors = new Set<string>();
   readonly #startedAt = nowSeconds();
+  /** The relay's key, learned from the member lists it returned; only it may change the directory. */
+  #relayKey: string | undefined;
   #channelSubscriptions: (() => void)[] = [];
   #subscriptionGeneration = 0;
-  #retryTimer: ReturnType<typeof setInterval> | undefined;
+  /** A rediscovery after the relay refused a subscription, at most one at a time. */
+  #rediscovery: ReturnType<typeof setTimeout> | undefined;
+  #timers: ReturnType<typeof setInterval>[] = [];
   #stopped = false;
 
   private constructor(options: KeeperOptions) {
@@ -146,24 +179,22 @@ export class Keeper {
       about: this.#options.about,
     });
     await this.#discoverChannels();
-    await this.#openExistingDomains();
-    this.#relay.subscribe(
-      "keeper-membership",
-      () => [
-        {
-          kinds: [Kind.MemberAdded, Kind.MemberRemoved],
-          "#p": [this.pubkey],
-          since: this.#startedAt - 60,
-        },
-      ],
-      { onEvent: (event) => this.#enqueue(event) },
-    );
+    await this.#resumeDomains();
+    this.#subscribeOrdered("keeper-membership", () => ({
+      kinds: [Kind.MemberAdded, Kind.MemberRemoved],
+      "#p": [this.pubkey],
+      since: this.#startedAt - 60,
+    }));
     this.#subscribeChannels();
-    this.#retryTimer = setInterval(
-      () => this.#pumpRetries(),
-      Math.min(1_000, this.#options.retryBaseMs ?? 2_000),
-    );
-    this.#retryTimer.unref();
+    const tick = Math.min(1_000, this.#options.retryBaseMs ?? 2_000);
+    this.#timers = [
+      setInterval(() => {
+        this.#pumpRetries();
+        this.#saveCursors();
+      }, tick),
+      setInterval(() => void this.#sweepDomains(), 60_000),
+    ];
+    for (const timer of this.#timers) timer.unref();
     log.info("keeper started", {
       pubkey: this.pubkey,
       channels: this.#directory.all().length,
@@ -174,10 +205,13 @@ export class Keeper {
   async stop(): Promise<void> {
     if (this.#stopped) return;
     this.#stopped = true;
-    clearInterval(this.#retryTimer);
+    for (const timer of this.#timers) clearInterval(timer);
+    clearTimeout(this.#rediscovery);
     for (const unsubscribe of this.#channelSubscriptions) unsubscribe();
     await Promise.allSettled([...this.#queues.values()]);
+    this.#saveCursors();
     await this.#relay.stop();
+    await Promise.allSettled([...this.#closing.values()]);
     for (const domain of this.#domains.values()) {
       await (await domain).close(this.#context).catch(() => {});
     }
@@ -187,14 +221,28 @@ export class Keeper {
 
   // ─── Channels and membership ──────────────────────────────────────────────
 
+  /** Rebuild the channel list from the relay: the channels whose member lists name Keeper. */
   async #discoverChannels(): Promise<void> {
-    const memberLists = await this.#relay.query([
-      { kinds: [Kind.ChannelMembers], "#p": [this.pubkey] },
-    ]);
+    const { events: memberLists, complete } = await this.#relay.queryAll({
+      kinds: [Kind.ChannelMembers],
+      "#p": [this.pubkey],
+    });
+    if (!complete) {
+      this.#options.log.warn("channel discovery stopped at its page limit");
+    }
     const ids: string[] = [];
     for (const event of memberLists) {
-      const channel = this.#directory.apply(event);
-      if (channel !== undefined) ids.push(channel.id);
+      this.#relayKey ??= event.pubkey;
+      if (event.pubkey !== this.#relayKey) continue;
+      this.#directory.apply(event);
+      const id = tagValue(event, "d");
+      if (id !== undefined) ids.push(id);
+    }
+    if (complete) {
+      const current = new Set(ids);
+      for (const channel of this.#directory.all()) {
+        if (!current.has(channel.id)) this.#directory.delete(channel.id);
+      }
     }
     for (let start = 0; start < ids.length; start += 100) {
       const batch = ids.slice(start, start + 100);
@@ -219,7 +267,10 @@ export class Keeper {
           "#d": [channelId],
         },
       ]);
-      for (const metadata of events) this.#directory.apply(metadata);
+      for (const metadata of events) {
+        this.#relayKey ??= metadata.pubkey;
+        this.#directory.apply(metadata);
+      }
       this.#control.advance(channelId, event.created_at);
       this.#options.log.info("added to channel", { channelId });
     }
@@ -238,20 +289,157 @@ export class Keeper {
       this.#startedAt - (this.#options.initialLookbackSeconds ?? 60);
     for (let start = 0; start < ids.length; start += 100) {
       const batch = ids.slice(start, start + 100);
-      const since = () =>
-        Math.min(...batch.map((id) => this.#control.since(id, fallback)));
       this.#channelSubscriptions.push(
-        this.#relay.subscribe(
+        this.#subscribeOrdered(
           `keeper-channels-${generation}-${start / 100}`,
-          () => [{ kinds: CHANNEL_KINDS, "#h": batch, since: since() }],
-          {
-            onEvent: (event) => this.#enqueue(event),
-            onClosed: (reason) =>
-              this.#options.log.warn("channel subscription closed", { reason }),
+          () => ({
+            kinds: CHANNEL_KINDS,
+            "#h": batch,
+            since: Math.min(
+              ...batch.map((id) => this.#control.since(id, fallback)),
+            ),
+          }),
+          // One REQ serves the whole batch from its oldest channel's window.
+          // Events older than their own channel's window were handled, and
+          // the records that deduplicate them may be gone, so they stop here.
+          (event) => {
+            const channelId = channelOf(event) ?? tagValue(event, "d");
+            return (
+              channelId === undefined ||
+              event.created_at >= this.#control.since(channelId, fallback)
+            );
           },
         ),
       );
     }
+  }
+
+  /**
+   * Subscribe so stored events reach `#enqueue` oldest first. The relay sends
+   * them newest first and at most a page at a time, so they are held until
+   * EOSE, the older ones are paged in when the page came back full, and the
+   * lot is sorted; then live events pass straight through. Every REQ, also the
+   * one after a reconnect, starts this over. When paging fails, the REQ is sent
+   * again later rather than handing on a catch-up with a hole in it.
+   */
+  #subscribeOrdered(
+    id: string,
+    filter: () => Filter,
+    accept: (event: NostrEvent) => boolean = () => true,
+  ): () => void {
+    let held: NostrEvent[] | undefined = [];
+    let request = 0;
+    let current: Filter | undefined;
+    let failures = 0;
+    // The relay's page as it came, before `accept`: whether to page back
+    // depends on how full it was, not on what was kept.
+    let stored = 0;
+    let oldest = Number.POSITIVE_INFINITY;
+    return this.#relay.subscribe(
+      id,
+      () => {
+        current = { ...filter(), limit: CATCH_UP_PAGE };
+        return [current];
+      },
+      {
+        onRequest: () => {
+          request += 1;
+          held = [];
+          stored = 0;
+          oldest = Number.POSITIVE_INFINITY;
+        },
+        onEvent: (event) => {
+          if (held !== undefined) {
+            stored += 1;
+            oldest = Math.min(oldest, event.created_at);
+          }
+          if (!accept(event)) return;
+          if (held === undefined) this.#enqueue(event);
+          else held.push(event);
+        },
+        onEose: () => {
+          const mine = request;
+          const asked = current;
+          if (held === undefined || asked === undefined) return;
+          const paging =
+            stored < CATCH_UP_PAGE
+              ? Promise.resolve([])
+              : this.#olderThan(oldest, asked);
+          void paging.then(
+            (older) => {
+              if (mine !== request || held === undefined) return;
+              const events = [...older.filter(accept), ...held];
+              held = undefined;
+              failures = 0;
+              events.sort(
+                (a, b) =>
+                  a.created_at - b.created_at ||
+                  (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+              );
+              for (const event of events) this.#enqueue(event);
+            },
+            (error: unknown) => {
+              failures += 1;
+              const delayMs = Math.min(60_000, 1_000 * 2 ** failures);
+              this.#options.log.warn("catch-up failed; starting it over", {
+                id,
+                delayMs,
+                error: String(error),
+              });
+              setTimeout(() => {
+                if (mine === request && !this.#stopped) this.#relay.refresh(id);
+              }, delayMs).unref();
+            },
+          );
+        },
+        onClosed: (reason) => {
+          this.#options.log.error("subscription refused by the relay", {
+            id,
+            reason,
+          });
+          // Usually access to a channel was revoked: rebuild the channel list.
+          this.#scheduleRediscovery();
+        },
+      },
+    );
+  }
+
+  /**
+   * Rediscover channels and resubscribe, 30 s after the relay refused a
+   * subscription for good; refusals in between share one rediscovery.
+   */
+  #scheduleRediscovery(): void {
+    if (this.#stopped || this.#rediscovery !== undefined) return;
+    this.#rediscovery = setTimeout(() => {
+      this.#discoverChannels().then(
+        () => {
+          this.#rediscovery = undefined;
+          this.#subscribeChannels();
+        },
+        (error: unknown) => {
+          this.#rediscovery = undefined;
+          this.#options.log.error("could not refresh channels", {
+            error: String(error),
+          });
+          this.#scheduleRediscovery();
+        },
+      );
+    }, 30_000);
+    this.#rediscovery.unref();
+  }
+
+  /** Stored events from `until` back, for a catch-up whose first page came back full. */
+  async #olderThan(until: number, filter: Filter): Promise<NostrEvent[]> {
+    const { events, complete } = await this.#relay.queryAll(
+      { ...filter, until },
+      { pageSize: CATCH_UP_PAGE },
+    );
+    if (!complete) {
+      this.#options.log.warn("catch-up stopped at its page limit", {
+        until,
+      });
+    }
+    return events;
   }
 
   // ─── Events ───────────────────────────────────────────────────────────────
@@ -262,21 +450,37 @@ export class Keeper {
    * after the last attempt Keeper says so in the thread, so nobody waits on a
    * request that will never be answered.
    */
-  #enqueue(event: NostrEvent): void {
+  #enqueue(event: NostrEvent, mode: Mode = "handle"): void {
     if (this.#stopped || this.#seen.has(event.id)) return;
     this.#seen.add(event.id);
-    if (event.kind === Kind.ChannelMembers) {
-      this.#directory.apply(event);
+    if (
+      event.kind === Kind.ChannelMetadata ||
+      event.kind === Kind.ChannelMembers
+    ) {
+      // Relay-signed facts the router and the flow checks read: applied at once.
+      if (this.#relayKey === undefined || event.pubkey === this.#relayKey) {
+        this.#directory.apply(event);
+      }
       return;
     }
+    const channelId = CHANNEL_KINDS.includes(event.kind)
+      ? channelOf(event)
+      : undefined;
+    if (channelId !== undefined)
+      this.#inflightOf(channelId).set(event.id, event.created_at);
     const key = this.#queueKeyOf(event);
     const previous = this.#queues.get(key) ?? Promise.resolve();
     const next = previous
-      .then(() => this.#handle(event))
+      .then(() =>
+        mode === "handle" ? this.#handle(event) : this.#apologize(event),
+      )
       .then(
-        () => this.#settled(event, undefined),
-        (error: unknown) => this.#settled(event, error),
-      );
+        () => this.#settled(event, mode, undefined),
+        (error: unknown) => this.#settled(event, mode, error ?? "error"),
+      )
+      .finally(() => {
+        if (channelId !== undefined) this.#release(channelId, event);
+      });
     this.#queues.set(key, next);
     void next.finally(() => {
       if (this.#queues.get(key) === next) this.#queues.delete(key);
@@ -299,30 +503,33 @@ export class Keeper {
       return key;
     }
     const target = tagValue(event, "e");
-    return (
-      (target === undefined ? undefined : this.#messageThreads.get(target)) ??
-      `channel:${channelId ?? event.id}`
-    );
+    const targetThread =
+      target === undefined
+        ? undefined
+        : (this.#messageThreads.get(target) ??
+          this.#control.placesOf(target)[0]?.threadKey);
+    return targetThread ?? `channel:${channelId ?? event.id}`;
   }
 
-  #settled(event: NostrEvent, error: unknown): void {
+  /** Record how handling ended: clear its retry record, or schedule the next attempt. */
+  #settled(event: NostrEvent, mode: Mode, error: unknown): void {
     const { log } = this.#options;
     try {
       if (error === undefined) {
-        const channelId = channelOf(event);
-        if (channelId !== undefined)
-          this.#control.advance(channelId, event.created_at);
-        if (this.#retrying.delete(event.id)) this.#control.clearRetry(event.id);
+        this.#control.clearRetry(event.id);
         return;
       }
       const attempts = this.#control.retryAttempts(event.id) + 1;
-      if (attempts < MAX_ATTEMPTS) {
+      const limit =
+        mode === "handle" ? MAX_ATTEMPTS : MAX_ATTEMPTS + MAX_APOLOGY_ATTEMPTS;
+      if (attempts < limit) {
+        // The last handling attempt hands over to the apology, which starts at once.
+        const step = mode === "handle" ? attempts : attempts - MAX_ATTEMPTS + 1;
         const delayMs = Math.min(
           60_000,
-          (this.#options.retryBaseMs ?? 2_000) * 2 ** (attempts - 1),
+          (this.#options.retryBaseMs ?? 2_000) * 2 ** (step - 1),
         );
         this.#control.scheduleRetry(event, attempts, Date.now() + delayMs);
-        this.#retrying.add(event.id);
         this.#seen.delete(event.id);
         log.warn("event handling failed; will retry", {
           eventId: event.id,
@@ -331,15 +538,23 @@ export class Keeper {
         });
         return;
       }
+      if (mode === "handle") {
+        // Out of attempts: the apology is next, as a retry of its own.
+        this.#control.scheduleRetry(event, MAX_ATTEMPTS, Date.now());
+        this.#seen.delete(event.id);
+        log.error("event handling failed; telling the thread", {
+          eventId: event.id,
+          attempts,
+          error: String(error),
+        });
+        return;
+      }
       // Terminal: stays in #seen, so only a restart's replay can try it again.
-      this.#retrying.delete(event.id);
       this.#control.clearRetry(event.id);
-      log.error("event handling failed; giving up", {
+      log.error("could not tell the thread about a failed request", {
         eventId: event.id,
-        attempts,
         error: String(error),
       });
-      void this.#apologize(event);
     } catch (bookkeeping) {
       log.error("could not record event outcome", {
         eventId: event.id,
@@ -352,9 +567,13 @@ export class Keeper {
   #pumpRetries(): void {
     if (this.#stopped) return;
     try {
-      for (const event of this.#control.dueRetries(Date.now(), 100)) {
-        this.#retrying.add(event.id);
-        this.#enqueue(event);
+      const now = Date.now();
+      for (const { event, attempts } of this.#control.takeDueRetries(
+        now,
+        now + 60_000,
+        100,
+      )) {
+        this.#enqueue(event, attempts >= MAX_ATTEMPTS ? "apologize" : "handle");
       }
     } catch (error) {
       this.#options.log.error("could not read retries", {
@@ -367,17 +586,58 @@ export class Keeper {
   async #apologize(event: NostrEvent): Promise<void> {
     const decision = this.#route(event);
     if (decision.type !== "request" && decision.type !== "control") return;
-    try {
-      await this.#notice(
-        decision.thread,
-        event,
-        "Sorry, I couldn't take this request. Please ask me again in a moment.",
-      );
-    } catch (error) {
-      this.#options.log.error("could not post apology", {
-        eventId: event.id,
-        error: String(error),
-      });
+    await this.#notice(
+      decision.thread,
+      event,
+      "Sorry, I couldn't take this request. Please ask me again in a moment.",
+    );
+  }
+
+  #inflightOf(channelId: string): Map<string, number> {
+    let events = this.#inflight.get(channelId);
+    if (events === undefined) {
+      events = new Map();
+      this.#inflight.set(channelId, events);
+    }
+    return events;
+  }
+
+  #release(channelId: string, event: NostrEvent): void {
+    this.#inflight.get(channelId)?.delete(event.id);
+    this.#settledMarks.set(
+      channelId,
+      Math.max(this.#settledMarks.get(channelId) ?? 0, event.created_at),
+    );
+    this.#dirtyCursors.add(channelId);
+  }
+
+  /**
+   * Move each channel's cursor up to the newest settled event, but never past
+   * an older one still in flight: a crash replays from 900 s before the cursor,
+   * which must still reach every event that was not handled.
+   */
+  #saveCursors(): void {
+    for (const channelId of this.#dirtyCursors) {
+      const settled = this.#settledMarks.get(channelId);
+      if (settled === undefined) continue;
+      const pending = this.#inflight.get(channelId);
+      let mark = settled;
+      for (const createdAt of pending?.values() ?? []) {
+        mark = Math.min(mark, createdAt - 1);
+      }
+      try {
+        this.#control.advance(channelId, mark);
+      } catch (error) {
+        this.#options.log.error("could not save a cursor", {
+          channelId,
+          error: String(error),
+        });
+        continue;
+      }
+      if (pending === undefined || pending.size === 0) {
+        this.#inflight.delete(channelId);
+        this.#dirtyCursors.delete(channelId);
+      }
     }
   }
 
@@ -403,9 +663,10 @@ export class Keeper {
       return this.#onMembership(event);
     let decision = this.#route(event);
     if (decision.type === "request" || decision.type === "control") {
-      // Whether the author is an agent comes from their profile; load it before
-      // letting them wake Keeper, then decide again. The thread stays the same.
-      await this.#broker.displayName(event.pubkey);
+      // Whether the author is an agent comes from their profile. Load it before
+      // letting them wake Keeper, then decide again; the thread stays the same.
+      // If the relay cannot be asked, the event is retried rather than misjudged.
+      await this.#broker.loadProfile(event.pubkey);
       decision = this.#route(event);
     }
     switch (decision.type) {
@@ -413,16 +674,8 @@ export class Keeper {
         return this.#request(event, decision.thread);
       case "context":
         return this.#contextMessage(event, decision.thread);
-      case "control": {
-        // A replay must not stop or report twice. Recorded after success, so a
-        // failure is retried; only a crash in between can repeat a notice.
-        if (this.#control.handled(event.id)) return;
-        if (decision.control === "stop")
-          await this.#stop(event, decision.thread);
-        else await this.#status(event, decision.thread);
-        this.#control.markHandled(event, decision.thread.channelId);
-        return;
-      }
+      case "control":
+        return this.#controlCommand(event, decision.thread, decision.control);
       case "edit":
         return this.#rewrite(event, decision.target, "replace");
       case "delete":
@@ -461,7 +714,7 @@ export class Keeper {
       };
       return true;
     }, this.#context);
-    this.#messageThreads.set(event.id, thread.key);
+    this.#control.addMessages([event.id], domain.key, thread.key);
     if (!created) return; // A replayed event: already acknowledged.
     this.#options.log.info("request admitted", {
       domain: domain.key,
@@ -475,6 +728,20 @@ export class Keeper {
   async #contextMessage(event: NostrEvent, thread: ThreadRef): Promise<void> {
     const domainKey = this.#control.domainOfThread(thread.key);
     if (domainKey === undefined) return;
+    // The conversation carries the audience its channel had when it started.
+    // After a visibility change, new messages must not flow into it; the next
+    // request in the thread starts a conversation in the right domain.
+    if (domainKey !== this.#directory.audienceOf(thread.channelId)?.domain) {
+      return;
+    }
+    // Already there, from the thread history the conversation started with.
+    if (
+      this.#control
+        .placesOf(event.id)
+        .some((place) => place.domain === domainKey)
+    ) {
+      return;
+    }
     const conversation = await (await this.#domain(domainKey)).find(
       thread.key,
       this.#context,
@@ -498,55 +765,103 @@ export class Keeper {
       },
       this.#context,
     );
-    this.#messageThreads.set(event.id, thread.key);
+    this.#control.addMessages([event.id], domainKey, thread.key);
   }
 
-  /** Apply an edit (`replace`) or deletion (`omit`) to the message's entry, so the model sees what people see. */
+  /**
+   * Apply an edit (`replace`) or deletion (`omit`) to every conversation the
+   * message entered, so the model sees what people see. An edit made after
+   * the channel changed audience removes the old text instead of carrying the
+   * new text into a conversation with the old audience.
+   */
   async #rewrite(
     event: NostrEvent,
     target: string,
     action: "replace" | "omit",
   ): Promise<void> {
-    const threadKey = this.#messageThreads.get(target);
-    const domainKey =
-      threadKey === undefined
-        ? undefined
-        : this.#control.domainOfThread(threadKey);
-    if (threadKey === undefined || domainKey === undefined) return;
-    const conversation = await (await this.#domain(domainKey)).find(
-      threadKey,
-      this.#context,
-    );
-    if (conversation === undefined) return;
-    const entryId = await findMessageEntry(conversation, target, this.#context);
-    if (entryId === undefined) return;
-    const edit =
-      action === "omit"
-        ? { target: entryId, action: "omit" as const }
-        : {
-            target: entryId,
-            action: "replace" as const,
-            messages: [
-              userMessage(
-                await this.#render({ ...event, id: target }),
-                event.created_at,
-              ),
-            ],
-          };
-    await conversation.submit(
-      {
-        type: "write",
-        entry: {
-          kind: `buzz.${action === "omit" ? "deletion" : "edit"}`,
-          edits: [edit],
+    for (const place of this.#control.placesOf(target)) {
+      const domain = await this.#domain(place.domain);
+      const conversation = await domain.find(place.threadKey, this.#context);
+      if (conversation === undefined) continue;
+      const sameAudience =
+        this.#directory.audienceOf(channelOfThread(place.threadKey))?.domain ===
+        place.domain;
+      const effective =
+        action === "replace" && sameAudience ? "replace" : "omit";
+      const found = await locateMessage(
+        domain,
+        conversation,
+        target,
+        this.#context,
+      );
+      if (found === undefined) continue;
+      if ("queued" in found) {
+        if (effective === "replace") {
+          // Not in the transcript yet; the retry applies it once it is.
+          throw new Error(`message ${target} is not placed yet`);
+        }
+        const result = await domain.harness.abortSubmission(
+          found.queued,
+          this.#context,
+          conversation.id,
+        );
+        if (result !== "already_placed") continue;
+        // Placed in the meantime: the retry finds its entry.
+        throw new Error(`message ${target} was placed while being withdrawn`);
+      }
+      const edit =
+        effective === "omit"
+          ? { target: found.entry, action: "omit" as const }
+          : {
+              target: found.entry,
+              action: "replace" as const,
+              messages: [
+                userMessage(
+                  await this.#render({ ...event, id: target }),
+                  event.created_at,
+                ),
+              ],
+            };
+      await conversation.submit(
+        {
+          type: "write",
+          entry: {
+            kind: `buzz.${effective === "omit" ? "deletion" : "edit"}`,
+            edits: [edit],
+          },
+          requestId: event.id,
         },
-        requestId: event.id,
-      },
-      this.#context,
-    );
+        this.#context,
+      );
+    }
   }
 
-  async #stop(event: NostrEvent, thread: ThreadRef): Promise<void> {
+  /**
+   * Carry out `stop` or `status` once, then post its notice. The action and
+   * its notice are recorded before the notice goes out, so a failed notice is
+   * retried without stopping again, and a replay repeats neither.
+   */
+  async #controlCommand(
+    event: NostrEvent,
+    thread: ThreadRef,
+    control: Control,
+  ): Promise<void> {
+    let record = this.#control.control(event.id);
+    if (record?.done === true) return;
+    if (record === undefined) {
+      const notice =
+        control === "stop"
+          ? await this.#stop(thread)
+          : await this.#status(thread);
+      this.#control.recordControl(event, thread.channelId, notice);
+      record = { notice, done: false };
+    }
+    await this.#notice(thread, event, record.notice);
+    this.#control.finishControl(event.id);
+  }
+
+  /** Stop the thread's run and its research jobs; returns the notice. */
+  async #stop(thread: ThreadRef): Promise<string> {
     const domainKey = this.#control.domainOfThread(thread.key);
     const domain =
       domainKey === undefined ? undefined : await this.#domain(domainKey);
@@ -555,8 +870,7 @@ export class Keeper {
         ? undefined
         : await domain.find(thread.key, this.#context);
     if (domain === undefined || conversation === undefined) {
-      await this.#notice(thread, event, "There is nothing running here.");
-      return;
+      return "There is nothing running here.";
     }
     const jobs = await domain.harness.snapshot(
       ResearchJobsDoc,
@@ -572,10 +886,11 @@ export class Keeper {
       await child?.abort(this.#context);
     }
     await conversation.abort(this.#context);
-    await this.#notice(thread, event, "Stopped.");
+    return "Stopped.";
   }
 
-  async #status(event: NostrEvent, thread: ThreadRef): Promise<void> {
+  /** What the thread's conversation is doing; returns the notice. */
+  async #status(thread: ThreadRef): Promise<string> {
     const domainKey = this.#control.domainOfThread(thread.key);
     const domain =
       domainKey === undefined ? undefined : await this.#domain(domainKey);
@@ -584,12 +899,7 @@ export class Keeper {
         ? undefined
         : await domain.find(thread.key, this.#context);
     if (domain === undefined || conversation === undefined) {
-      await this.#notice(
-        thread,
-        event,
-        "I haven't been asked anything in this thread yet.",
-      );
-      return;
+      return "I haven't been asked anything in this thread yet.";
     }
     const harness = domain.harness;
     const live = await harness.snapshot(
@@ -605,7 +915,7 @@ export class Keeper {
     const jobs = Object.entries(
       (await harness.snapshot(ResearchJobsDoc, conversation.id, this.#context))
         ?.jobs ?? {},
-    );
+    ).sort(([, a], [, b]) => b.startedAt - a.startedAt);
     const usage = await harness.snapshot(
       UsageDoc,
       conversation.id,
@@ -620,12 +930,15 @@ export class Keeper {
         ? "Idle in this thread."
         : "Working on a request in this thread.",
       `${inbox?.items.length ?? 0} queued.`,
-      ...jobs.map(
-        ([id, job]) => `Research ${id}: ${job.status} — ${job.question}`,
-      ),
+      ...jobs
+        .slice(0, STATUS_JOBS)
+        .map(([id, job]) => `Research ${id}: ${job.status} — ${job.question}`),
+      ...(jobs.length > STATUS_JOBS
+        ? [`…and ${jobs.length - STATUS_JOBS} earlier research jobs.`]
+        : []),
       `Model spend here so far: $${cost.toFixed(4)}.`,
     ];
-    await this.#notice(thread, event, lines.join("\n"));
+    return lines.join("\n");
   }
 
   // ─── Conversations and domains ────────────────────────────────────────────
@@ -654,7 +967,7 @@ export class Keeper {
       thread.key,
       state,
       { model: this.#options.model },
-      () => this.#history(state, trigger),
+      () => this.#history(state, thread, trigger),
       this.#context,
     );
     this.#control.addThread(thread.key, audience.domain);
@@ -664,6 +977,7 @@ export class Keeper {
   /** The thread so far, for a new conversation: the messages before the one that addressed Keeper. */
   async #history(
     state: ThreadState,
+    thread: ThreadRef,
     trigger: NostrEvent,
   ): Promise<HistoryEntry[]> {
     const events = await this.#broker.channelRead(state.domain, {
@@ -684,27 +998,35 @@ export class Keeper {
           createdAt: event.created_at,
         },
       });
-      this.#messageThreads.set(event.id, threadKeyOf(state));
     }
+    this.#control.addMessages(
+      entries.map((entry) => entry.data.eventId),
+      state.domain,
+      thread.key,
+    );
     return entries;
   }
 
   #domain(key: string): Promise<Domain> {
+    this.#lastUsed.set(key, Date.now());
     let domain = this.#domains.get(key);
     if (domain === undefined) {
-      domain = Domain.open(
-        {
-          key,
-          dataDir: this.#options.dataDir,
-          models: this.#options.models,
-          registry: this.#agent.registry,
-          settings: {
-            extensions: this.#agent.threadExtensions,
-            ...this.#options.settings,
+      const closing = this.#closing.get(key) ?? Promise.resolve();
+      domain = closing.then(() =>
+        Domain.open(
+          {
+            key,
+            dataDir: this.#options.dataDir,
+            models: this.#options.models,
+            registry: this.#agent.registry,
+            settings: {
+              extensions: this.#agent.threadExtensions(key),
+              ...this.#options.settings,
+            },
+            log: this.#options.log,
           },
-          log: this.#options.log,
-        },
-        this.#context,
+          this.#context,
+        ),
       );
       this.#domains.set(key, domain);
       domain.catch(() => this.#domains.delete(key));
@@ -712,11 +1034,50 @@ export class Keeper {
     return domain;
   }
 
-  /** Reopen every domain with stored state, so unfinished runs, replies and research resume. */
-  async #openExistingDomains(): Promise<void> {
+  /**
+   * Reopen every domain with stored state, one at a time, so unfinished runs,
+   * replies and research resume; domains with nothing live close again.
+   */
+  async #resumeDomains(): Promise<void> {
     const directory = path.join(this.#options.dataDir, "domains");
     const keys = await readdir(directory).catch(() => [] as string[]);
-    await Promise.all(keys.map((key) => this.#domain(key)));
+    for (const key of keys) {
+      await this.#domain(key);
+      await this.#closeIfIdle(key, 0);
+    }
+  }
+
+  /** Close domains that have had nothing live for a while; they reopen on demand. */
+  async #sweepDomains(): Promise<void> {
+    for (const key of [...this.#domains.keys()]) {
+      if (this.#stopped) return;
+      await this.#closeIfIdle(key, DOMAIN_IDLE_MS).catch((error: unknown) =>
+        this.#options.log.warn("could not close an idle domain", {
+          domain: key,
+          error: String(error),
+        }),
+      );
+    }
+  }
+
+  async #closeIfIdle(key: string, idleMs: number): Promise<void> {
+    const opening = this.#domains.get(key);
+    if (opening === undefined) return;
+    const idle = () => Date.now() - (this.#lastUsed.get(key) ?? 0) >= idleMs;
+    if (!idle()) return;
+    const domain = await opening;
+    const inspection = await domain.harness.inspect(this.#context);
+    if (inspection.tasks.length > 0 || inspection.submissions.length > 0) {
+      return;
+    }
+    // Someone may have picked the domain up while it was being inspected.
+    if (this.#domains.get(key) !== opening || !idle()) return;
+    this.#domains.delete(key);
+    const closing = domain.close(this.#context).finally(() => {
+      if (this.#closing.get(key) === closing) this.#closing.delete(key);
+    });
+    this.#closing.set(key, closing);
+    await closing;
   }
 
   // ─── Output helpers ───────────────────────────────────────────────────────
@@ -790,37 +1151,40 @@ function userMessage(text: string, createdAt: number): UserMessage {
   return { role: "user", content: text, timestamp: createdAt * 1000 };
 }
 
-function threadKeyOf(state: ThreadState): string {
-  return state.dm
-    ? `dm:${state.channelId}`
-    : `${state.channelId}:${state.root}`;
+/** The channel of a thread key: `dm:<channel>` or `<channel>:<root>`. */
+function channelOfThread(threadKey: string): string {
+  return threadKey.startsWith("dm:")
+    ? threadKey.slice(3)
+    : (threadKey.split(":")[0] ?? threadKey);
 }
 
-/** The entry that carries a Buzz message, searched newest first through recent history. */
-async function findMessageEntry(
+/**
+ * Where a Buzz message sits in a conversation: its entry, or its submission
+ * while that is still queued. Requests and later messages are submissions
+ * keyed by event id; the thread history a conversation started with is in
+ * `HistoryDoc`.
+ */
+async function locateMessage(
+  domain: Domain,
   conversation: Conversation,
   eventId: string,
   context: Context,
-): Promise<EntryRecord["id"] | undefined> {
-  let cursor: Parameters<Conversation["entries"]>[2];
-  for (let page = 0; page < 10; page++) {
-    const result = await conversation.entries({}, 100, cursor, context);
-    for (const entry of result.items) {
-      if (BuzzMessageEntry.is(entry) && entry.data.eventId === eventId)
-        return entry.id;
-      const message = entry.model?.[0];
-      if (
-        entry.kind === "pi.user" &&
-        message?.role === "user" &&
-        typeof message.content === "string"
-      ) {
-        if (message.content.includes(`id="${eventId}"`)) return entry.id;
-      }
-    }
-    if (result.next === undefined) return undefined;
-    cursor = result.next;
+): Promise<{ entry: EntryId } | { queued: SubmissionId } | undefined> {
+  const record = await conversation.commit(
+    (tx) => tx.submissionByRequest(conversation.id, eventId),
+    context,
+  );
+  if (record !== undefined) {
+    if (record.status === "queued") return { queued: record.id };
+    return record.entry === undefined ? undefined : { entry: record.entry };
   }
-  return undefined;
+  const history = await domain.harness.snapshot(
+    HistoryDoc,
+    conversation.id,
+    context,
+  );
+  const entry = history?.entries[eventId];
+  return entry === undefined ? undefined : { entry: entry as EntryId };
 }
 
 /** Insertion-ordered set that forgets its oldest members past `limit`. */

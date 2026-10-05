@@ -77,6 +77,20 @@ export const AnswersDoc = defineDoc<{ claims: Record<string, number> }>({
   initial: () => ({ claims: {} }),
 });
 
+/**
+ * Entries of the thread history a conversation was created with, by Buzz event
+ * id. Those entries are appended directly rather than submitted, so this is
+ * how a later edit or deletion finds them.
+ */
+export const HistoryDoc = defineDoc<{ entries: Record<string, number> }>({
+  kind: "keeper.history",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ entries: {} }),
+});
+
 /** Data of a `buzz.message` entry: a Buzz event a conversation has seen. */
 export type BuzzMessageData = {
   eventId: string;

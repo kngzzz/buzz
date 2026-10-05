@@ -8,13 +8,13 @@ import type { Broker } from "../broker/broker.ts";
 import { defineReplyTask } from "../service/reply-task.ts";
 import { threadSections } from "./prompt.ts";
 import { researchExtension } from "./research.ts";
-import type { AgentServices } from "./services.ts";
+import { type AgentServices, mayUseWeb } from "./services.ts";
 import { buzzTools, webTools } from "./tools.ts";
 
 export type KeeperAgent = {
   readonly registry: Registry;
-  /** What a thread or DM conversation runs with by default. */
-  readonly threadExtensions: readonly Extension[];
+  /** What a thread or DM conversation of a domain runs with by default. */
+  readonly threadExtensions: (domain: string) => readonly Extension[];
   readonly replyTask: ReturnType<typeof defineReplyTask>;
 };
 
@@ -29,7 +29,8 @@ export type KeeperAgent = {
  * - `keeper.replies`  the reply task that posts answers exactly once
  *
  * Research workers select only `keeper.read` and `keeper.web`, so a worker
- * cannot start research of its own.
+ * cannot start research of its own. Private and DM domains get no
+ * `keeper.web` at all.
  */
 export function buildAgent(
   services: AgentServices,
@@ -47,8 +48,10 @@ export function buildAgent(
     name: "keeper.web",
     tools: webTools(services),
   });
-  const research = researchExtension(services, () => [read, web]);
-  const replyTask = defineReplyTask(broker);
+  const research = researchExtension(services, (domain) =>
+    mayUseWeb(domain) ? [read, web] : [read],
+  );
+  const replyTask = defineReplyTask(broker, services.log);
   const replies = defineExtension({
     name: "keeper.replies",
     tasks: [replyTask],
@@ -57,5 +60,10 @@ export function buildAgent(
   const registry = createRegistry();
   for (const extension of [core, read, web, research, replies])
     registry.install(extension);
-  return { registry, threadExtensions: [core, read, web, research], replyTask };
+  return {
+    registry,
+    threadExtensions: (domain) =>
+      mayUseWeb(domain) ? [core, read, web, research] : [core, read, research],
+    replyTask,
+  };
 }

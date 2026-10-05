@@ -23,7 +23,12 @@ export const FAUX_MODEL: ModelRef = {
  * - anything else gets an echo naming the person who asked and counting the
  *   earlier messages in its context, which shows that thread context arrives.
  */
-export function fauxBrain(): FauxProviderHandle {
+export function fauxBrain(
+  options: {
+    /** Test seam: hold a thread turn until the returned promise settles. */
+    readonly beforeTurn?: (request: string) => Promise<void> | undefined;
+  } = {},
+): FauxProviderHandle {
   const faux = fauxProvider({
     provider: FAUX_MODEL.provider,
     models: [
@@ -32,9 +37,11 @@ export function fauxBrain(): FauxProviderHandle {
   });
   const respond: FauxResponseFactory = (context) => {
     faux.appendResponses([respond]); // stay ready for the next request
-    return isWorker(context.messages)
-      ? workerTurn(context.messages)
-      : threadTurn(context.messages);
+    if (isWorker(context.messages)) return workerTurn(context.messages);
+    const hold = options.beforeTurn?.(latestRequest(context.messages).text);
+    return hold === undefined
+      ? threadTurn(context.messages)
+      : hold.then(() => threadTurn(context.messages));
   };
   faux.setResponses([respond]);
   return faux;

@@ -4,6 +4,7 @@ import {
   defineTask,
 } from "@earendil-works/pi-durable";
 import type { Broker } from "../broker/broker.ts";
+import type { Logger } from "../log.ts";
 import { Kind, nowSeconds, replyTags } from "../nostr/event.ts";
 import { AnswersDoc, ThreadDoc } from "../runtime/docs.ts";
 import { assistantText, chunkText } from "../runtime/render.ts";
@@ -21,13 +22,21 @@ type ReplyState =
   | { readonly phase: "wait" }
   | { readonly phase: "post"; readonly text: string };
 
+/** How a reply task ended: whether its answer reached the thread, and if not, why. */
+export type Delivery = {
+  readonly posted: boolean;
+  readonly reason: string | null;
+};
+
 /**
  * One durable task per request: wait for the answer, then post it into the
  * thread exactly once. Background, so `stop` in the thread never strands a
  * reply, and pi-durable resumes it after a crash in whichever phase it was.
+ * A reply the relay or the broker refuses for good ends the task with the
+ * reason in its result rather than faulting it.
  */
-export function defineReplyTask(broker: Broker) {
-  return defineTask<ReplyInput, ReplyState, null>({
+export function defineReplyTask(broker: Broker, log: Logger) {
+  return defineTask<ReplyInput, ReplyState, Delivery>({
     name: "keeper.reply",
     version: 1,
     initial: () => ({ phase: "wait" }),
@@ -80,6 +89,7 @@ export function defineReplyTask(broker: Broker) {
       },
       post: async (task, runtime, context) => {
         const { text } = task.state.checkpoint;
+        let delivery: Delivery = { posted: false, reason: "nothing to post" };
         if (text !== "") {
           const thread = await runtime.snapshot(
             ThreadDoc,
@@ -88,7 +98,7 @@ export function defineReplyTask(broker: Broker) {
           );
           if (thread === undefined) throw new Error("reply task has no thread");
           const parts = chunkText(text);
-          await publishOnce(
+          const outcome = await publishOnce(
             runtime,
             broker,
             {
@@ -110,11 +120,20 @@ export function defineReplyTask(broker: Broker) {
             })),
             context,
           );
+          delivery = outcome.ok
+            ? { posted: true, reason: null }
+            : { posted: false, reason: outcome.reason };
+          if (!outcome.ok) {
+            log.error("reply not delivered", {
+              requestId: task.input.requestId,
+              reason: outcome.reason,
+            });
+          }
         }
         await runtime.commit(
           () => ({
             status: "terminal",
-            outcome: { status: "completed", result: null },
+            outcome: { status: "completed", result: delivery },
           }),
           context,
         );

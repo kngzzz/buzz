@@ -10,16 +10,32 @@ import type { Logger } from "../log.ts";
 export type PublishResult = { readonly ok: boolean; readonly message: string };
 
 export type SubscriptionHandlers = {
+  /**
+   * Called just before each REQ goes out: on subscribe, after every
+   * reconnect, and after a retry. Stored events follow, newest first, then EOSE.
+   */
+  onRequest?(): void;
   onEvent(event: NostrEvent): void;
   onEose?(): void;
-  /** The relay closed the subscription for good, for example access was revoked. */
+  /** The relay refused the subscription for good, for example access was revoked. */
   onClosed?(reason: string): void;
 };
 
 type LiveSubscription = {
   readonly filters: () => readonly Filter[];
   readonly handlers: SubscriptionHandlers;
+  /** Temporary refusals since the last EOSE, for backoff. */
+  retries: number;
+  retryTimer: ReturnType<typeof setTimeout> | undefined;
 };
+
+type ReadyWaiter = {
+  readonly ready: () => void;
+  readonly fail: (error: Error) => void;
+};
+
+/** CLOSED reasons that will not change on retry; anything else (rate limits, timeouts) is retried. */
+const TERMINAL_CLOSED = /^(restricted|blocked|invalid):/;
 
 type PendingQuery = {
   readonly filters: readonly Filter[];
@@ -66,7 +82,7 @@ export class RelayClient {
   #authEventId: string | undefined;
   #authTimer: ReturnType<typeof setTimeout> | undefined;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
-  #readyWaiters: (() => void)[] = [];
+  #readyWaiters: ReadyWaiter[] = [];
 
   constructor(options: RelayClientOptions) {
     this.#options = options;
@@ -87,6 +103,11 @@ export class RelayClient {
     clearTimeout(this.#reconnectTimer);
     clearTimeout(this.#authTimer);
     this.#ready = false;
+    for (const live of this.#live.values()) clearTimeout(live.retryTimer);
+    const waiters = this.#readyWaiters;
+    this.#readyWaiters = [];
+    for (const waiter of waiters)
+      waiter.fail(new Error("relay client stopped"));
     for (const query of this.#queries.values()) {
       query.reject(new Error("relay client stopped"));
     }
@@ -105,15 +126,25 @@ export class RelayClient {
   /** Resolve once the connection is authenticated. */
   waitReady(timeoutMs = 30_000): Promise<void> {
     if (this.#ready) return Promise.resolve();
+    if (this.#stopped) return Promise.reject(new Error("relay client stopped"));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("timed out waiting for the relay")),
-        timeoutMs,
-      );
-      this.#readyWaiters.push(() => {
-        clearTimeout(timer);
-        resolve();
-      });
+      const waiter: ReadyWaiter = {
+        ready: () => {
+          clearTimeout(timer);
+          resolve();
+        },
+        fail: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      };
+      const timer = setTimeout(() => {
+        this.#readyWaiters = this.#readyWaiters.filter(
+          (item) => item !== waiter,
+        );
+        reject(new Error("timed out waiting for the relay"));
+      }, timeoutMs);
+      this.#readyWaiters.push(waiter);
     });
   }
 
@@ -128,10 +159,20 @@ export class RelayClient {
     filters: () => readonly Filter[],
     handlers: SubscriptionHandlers,
   ): () => void {
-    this.#live.set(id, { filters, handlers });
-    if (this.#ready) this.#send(["REQ", id, ...filters()]);
+    const live: LiveSubscription = {
+      filters,
+      handlers,
+      retries: 0,
+      retryTimer: undefined,
+    };
+    this.#live.set(id, live);
+    if (this.#ready) this.#request(id, live);
     return () => {
-      if (this.#live.delete(id) && this.#ready) this.#send(["CLOSE", id]);
+      clearTimeout(live.retryTimer);
+      if (this.#live.get(id) === live) {
+        this.#live.delete(id);
+        if (this.#ready) this.#send(["CLOSE", id]);
+      }
     };
   }
 
@@ -163,6 +204,54 @@ export class RelayClient {
       });
       this.#send(["REQ", id, ...filters]);
     });
+  }
+
+  /** Send a live subscription's REQ again, so its replay of stored events starts over. */
+  refresh(id: string): void {
+    const live = this.#live.get(id);
+    if (live === undefined || !this.#ready) return;
+    clearTimeout(live.retryTimer);
+    this.#request(id, live);
+  }
+
+  /**
+   * Every stored event matching `filter`, paging back with `until` past the
+   * relay's page limit. `complete` is false when `maxPages` ran out first. A
+   * single second holding more than a page of events can lose its excess.
+   */
+  async queryAll(
+    filter: Filter,
+    options: { readonly pageSize?: number; readonly maxPages?: number } = {},
+  ): Promise<{ readonly events: NostrEvent[]; readonly complete: boolean }> {
+    const pageSize = options.pageSize ?? 1_000;
+    const found = new Map<string, NostrEvent>();
+    let until = filter.until;
+    for (let page = 0; page < (options.maxPages ?? 50); page++) {
+      const events = await this.query([
+        {
+          ...filter,
+          limit: pageSize,
+          ...(until === undefined ? {} : { until }),
+        },
+      ]);
+      let fresh = 0;
+      let oldest = Number.POSITIVE_INFINITY;
+      for (const event of events) {
+        if (!found.has(event.id)) {
+          found.set(event.id, event);
+          fresh += 1;
+        }
+        oldest = Math.min(oldest, event.created_at);
+      }
+      if (events.length < pageSize)
+        return { events: [...found.values()], complete: true };
+      // `until` is inclusive, so the next page starts in the oldest second again.
+      until = fresh === 0 ? oldest - 1 : oldest;
+      if (filter.since !== undefined && until < filter.since) {
+        return { events: [...found.values()], complete: true };
+      }
+    }
+    return { events: [...found.values()], complete: false };
   }
 
   /** Publish and wait for the relay's OK. Re-sent across reconnects until answered or timed out. */
@@ -275,7 +364,10 @@ export class RelayClient {
           query.resolve(query.events);
           return;
         }
-        this.#live.get(subId)?.handlers.onEose?.();
+        const live = this.#live.get(subId);
+        if (live === undefined) return;
+        live.retries = 0;
+        live.handlers.onEose?.();
         return;
       }
       case "CLOSED": {
@@ -289,8 +381,24 @@ export class RelayClient {
         const live = this.#live.get(subId);
         if (live === undefined) return;
         if (reason.startsWith("auth-required")) return; // re-sent after auth
-        this.#live.delete(subId);
-        live.handlers.onClosed?.(reason);
+        if (TERMINAL_CLOSED.test(reason)) {
+          this.#live.delete(subId);
+          live.handlers.onClosed?.(reason);
+          return;
+        }
+        // Rate limits, timeouts and database errors pass: ask again, backing off.
+        const delayMs = Math.min(60_000, 1_000 * 2 ** live.retries);
+        live.retries += 1;
+        this.#options.log.warn("subscription closed by the relay; retrying", {
+          subId,
+          reason,
+          delayMs,
+        });
+        clearTimeout(live.retryTimer);
+        live.retryTimer = setTimeout(() => {
+          if (this.#live.get(subId) === live && this.#ready)
+            this.#request(subId, live);
+        }, delayMs);
         return;
       }
       case "OK": {
@@ -339,14 +447,21 @@ export class RelayClient {
     if (this.#ready || this.#socket === undefined) return;
     this.#ready = true;
     this.#attempt = 0;
-    for (const [id, live] of this.#live)
-      this.#send(["REQ", id, ...live.filters()]);
+    for (const [id, live] of this.#live) {
+      clearTimeout(live.retryTimer);
+      this.#request(id, live);
+    }
     for (const pending of this.#publishes.values())
       this.#send(["EVENT", pending.event]);
     const waiters = this.#readyWaiters;
     this.#readyWaiters = [];
-    for (const waiter of waiters) waiter();
+    for (const waiter of waiters) waiter.ready();
     for (const listener of this.#readyListeners) listener();
+  }
+
+  #request(id: string, live: LiveSubscription): void {
+    live.handlers.onRequest?.();
+    this.#send(["REQ", id, ...live.filters()]);
   }
 
   #send(frame: unknown[]): void {

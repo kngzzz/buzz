@@ -47,8 +47,20 @@ function place(services: AgentServices): PromptSection {
         : channel.visibility === "open"
           ? "an open channel that every member of the workspace can read"
           : `a private channel with ${channel.members.size} members`;
-    return `You are in a thread in #${thread.channelName}, ${audience}.`;
+    return `You are in a thread in the channel named ${quoted(thread.channelName)}, ${audience}.`;
   });
+}
+
+/**
+ * A channel name as quoted data. Members choose channel names, so one must not
+ * read as instructions once it sits in the system prompt.
+ */
+function quoted(name: string): string {
+  const flat = name
+    .replace(/[\p{Cc}\p{Cf}]+/gu, " ")
+    .trim()
+    .slice(0, 80);
+  return JSON.stringify(flat === "" ? "unnamed" : flat);
 }
 
 export function threadSections(services: AgentServices): PromptSection[] {

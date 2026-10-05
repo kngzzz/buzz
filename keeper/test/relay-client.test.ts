@@ -96,6 +96,73 @@ describe("RelayClient", () => {
     );
   });
 
+  it("asks again when the relay closes a subscription for a passing reason", async () => {
+    const seen: string[] = [];
+    let requests = 0;
+    let eose = 0;
+    client.subscribe(
+      "live",
+      () => [{ kinds: [Kind.StreamMessage], "#h": ["c1"] }],
+      {
+        onRequest: () => {
+          requests += 1;
+        },
+        onEvent: (event) => seen.push(event.content),
+        onEose: () => {
+          eose += 1;
+        },
+      },
+    );
+    await waitUntil(() => eose === 1);
+    relay.closeSubscriptions("rate-limited: too many concurrent requests");
+    await waitUntil(() => requests === 2 && eose === 2, 5_000);
+    relay.inject(alice, message("after the retry", "c1"));
+    await waitUntil(() => seen.includes("after the retry"));
+  });
+
+  it("gives up on a subscription the relay refuses for good", async () => {
+    const closed: string[] = [];
+    let requests = 0;
+    let eose = 0;
+    client.subscribe(
+      "revoked",
+      () => [{ kinds: [Kind.StreamMessage], "#h": ["c1"] }],
+      {
+        onRequest: () => {
+          requests += 1;
+        },
+        onEvent: () => {},
+        onEose: () => {
+          eose += 1;
+        },
+        onClosed: (reason) => closed.push(reason),
+      },
+    );
+    await waitUntil(() => eose === 1);
+    relay.closeSubscriptions("restricted: channel access revoked");
+    await waitUntil(() => closed.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(requests).toBe(1);
+  });
+
+  it("pages back past the relay's page limit", async () => {
+    const base = nowSeconds() - 100;
+    for (let index = 0; index < 25; index++) {
+      relay.inject(alice, {
+        ...message(`m${index}`, "c1"),
+        created_at: base + Math.floor(index / 3),
+      });
+    }
+    const { events, complete } = await client.queryAll(
+      { kinds: [Kind.StreamMessage], "#h": ["c1"] },
+      { pageSize: 10 },
+    );
+    expect(complete).toBe(true);
+    expect(events.map((event) => event.content).sort()).toEqual(
+      Array.from({ length: 25 }, (_, index) => `m${index}`).sort(),
+    );
+  });
+
   it("re-sends a publish whose OK was lost when the connection dropped", async () => {
     const event = keeper.sign({
       ...message("lost ok", "c1"),

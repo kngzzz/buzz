@@ -33,3 +33,12 @@ export type AgentServices = {
   ) => Promise<SafeFetchResult>;
   readonly log: Logger;
 };
+
+/**
+ * Whether a domain's conversations may reach the open web. Only the `public`
+ * domain may: a search query or a fetched URL written in a private channel or
+ * DM is private too (spec §9.6, §11.2), and nothing past the broker checks it.
+ */
+export function mayUseWeb(domain: string): boolean {
+  return domain === "public";
+}

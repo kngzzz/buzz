@@ -217,32 +217,21 @@ export class Broker {
       this.#log.warn("profile publish refused", { message: result.message });
   }
 
-  /** Display name for attribution, cached for ten minutes. */
-  async displayName(pubkey: string): Promise<string> {
-    return (await this.#profile(pubkey)).name;
-  }
-
-  /** Whether a profile already fetched says this pubkey is an agent (`bot: true`). */
-  isKnownAgent(pubkey: string): boolean {
-    return this.#names.get(pubkey)?.bot === true;
-  }
-
-  async #profile(
-    pubkey: string,
-  ): Promise<{ name: string; bot: boolean; at: number }> {
+  /**
+   * Fetch and cache a profile. Throws when the relay cannot be asked, so a
+   * caller deciding whether an author may wake Keeper retries instead of
+   * misjudging an agent as a person. A failed lookup is never cached.
+   */
+  async loadProfile(pubkey: string): Promise<void> {
     const cached = this.#names.get(pubkey);
-    if (cached !== undefined && Date.now() - cached.at < 600_000) return cached;
-    const profile = {
-      name: `${pubkey.slice(0, 8)}…`,
-      bot: false,
-      at: Date.now(),
-    };
-    try {
-      const [event] = await this.#relay.query(
-        [{ kinds: [Kind.Profile], authors: [pubkey], limit: 1 }],
-        5_000,
-      );
-      if (event !== undefined) {
+    if (cached !== undefined && Date.now() - cached.at < 600_000) return;
+    const [event] = await this.#relay.query(
+      [{ kinds: [Kind.Profile], authors: [pubkey], limit: 1 }],
+      5_000,
+    );
+    const profile = { name: shortKey(pubkey), bot: false, at: Date.now() };
+    if (event !== undefined) {
+      try {
         const parsed = JSON.parse(event.content) as {
           display_name?: unknown;
           name?: unknown;
@@ -250,13 +239,36 @@ export class Broker {
         };
         const candidate = parsed.display_name ?? parsed.name;
         if (typeof candidate === "string" && candidate.trim() !== "")
-          profile.name = candidate.trim();
+          profile.name = candidate.trim().slice(0, 100);
         profile.bot = parsed.bot === true;
+      } catch {
+        // Unparseable profile content: keep the short key.
       }
+    }
+    this.#names.delete(pubkey);
+    this.#names.set(pubkey, profile);
+    if (this.#names.size > 10_000) {
+      const oldest = this.#names.keys().next().value;
+      if (oldest !== undefined) this.#names.delete(oldest);
+    }
+  }
+
+  /** Display name for attribution, cached for ten minutes; the short key when unknown. */
+  async displayName(pubkey: string): Promise<string> {
+    try {
+      await this.loadProfile(pubkey);
     } catch {
       // Attribution falls back to the short key; never fail a request over a name.
     }
-    this.#names.set(pubkey, profile);
-    return profile;
+    return this.#names.get(pubkey)?.name ?? shortKey(pubkey);
   }
+
+  /** Whether a profile already fetched says this pubkey is an agent (`bot: true`). */
+  isKnownAgent(pubkey: string): boolean {
+    return this.#names.get(pubkey)?.bot === true;
+  }
+}
+
+function shortKey(pubkey: string): string {
+  return `${pubkey.slice(0, 8)}…`;
 }

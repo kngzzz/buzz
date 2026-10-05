@@ -64,12 +64,16 @@ export const MESSAGE_KINDS: readonly number[] = [
   Kind.ForumComment,
 ];
 
-/** Everything Keeper subscribes to inside a channel (`#h`). */
+/**
+ * Everything Keeper subscribes to inside a channel (`#h`). Metadata and member
+ * lists carry only a `d` tag; the relay matches them to `#h` by their channel.
+ */
 export const CHANNEL_KINDS: readonly number[] = [
   ...MESSAGE_KINDS,
   Kind.StreamMessageEdit,
   Kind.Deletion,
   Kind.ModerationRemove,
+  Kind.ChannelMetadata,
   Kind.ChannelMembers,
 ];
 

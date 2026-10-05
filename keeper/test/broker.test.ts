@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Broker, BrokerRefusal } from "../src/broker/broker.ts";
 import { Directory } from "../src/broker/directory.ts";
 import { silentLogger } from "../src/log.ts";
-import { Kind } from "../src/nostr/event.ts";
+import { Kind, nowSeconds } from "../src/nostr/event.ts";
 import { Signer } from "../src/nostr/signer.ts";
 import { RelayClient } from "../src/relay/client.ts";
 import { FakeRelay } from "./fake-relay.ts";
@@ -207,15 +207,51 @@ describe("information flow through the broker", () => {
     expect(broker.mayPublish(launch, ids.launchTwin)).toBe(false);
     // Once the twin's readers fit inside launch's audience, launch output may flow there…
     directory.apply(
-      relay.setMembers(ids.launchTwin, [alice.pubkey, keeper.pubkey]),
+      relay.setMembers(
+        ids.launchTwin,
+        [alice.pubkey, keeper.pubkey],
+        nowSeconds() + 1,
+      ),
     );
     expect(broker.mayPublish(launch, ids.launchTwin)).toBe(true);
     // …and when launch gains a member, its audience moves to a new epoch.
     const before = directory.audienceOf(ids.launch)?.epoch;
     directory.apply(
-      relay.setMembers(ids.launch, [alice.pubkey, keeper.pubkey, carol.pubkey]),
+      relay.setMembers(
+        ids.launch,
+        [alice.pubkey, keeper.pubkey, carol.pubkey],
+        nowSeconds() + 1,
+      ),
     );
     expect(directory.audienceOf(ids.launch)?.epoch).not.toBe(before);
     expect(broker.mayPublish(launch, ids.launchTwin)).toBe(true);
+  });
+});
+
+describe("Directory", () => {
+  const metadata = (visibility: "public" | "private", at: number) =>
+    relay.relaySigner.sign({
+      kind: Kind.ChannelMetadata,
+      created_at: at,
+      tags: [["d", "c9"], ["name", "deal"], [visibility], ["t", "stream"]],
+      content: "",
+    });
+
+  it("keeps the newest channel state when replays arrive out of order", () => {
+    const fresh = new Directory();
+    const now = nowSeconds();
+    fresh.apply(metadata("private", now));
+    expect(fresh.apply(metadata("public", now - 60))).toBeUndefined();
+    expect(fresh.get("c9")?.visibility).toBe("private");
+    fresh.apply(metadata("public", now + 60));
+    expect(fresh.get("c9")?.visibility).toBe("open");
+  });
+
+  it("takes a channel's state again after Keeper left and rejoined", () => {
+    const fresh = new Directory();
+    const event = metadata("public", nowSeconds());
+    fresh.apply(event);
+    fresh.delete("c9");
+    expect(fresh.apply(event)?.visibility).toBe("open");
   });
 });

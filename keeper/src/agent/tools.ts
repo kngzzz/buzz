@@ -1,13 +1,15 @@
+import type { Context } from "@earendil-works/chord";
 import { Type } from "@earendil-works/pi-ai";
 import {
   defineTool,
+  type ToolExecutionApi,
   type ToolExecutionResult,
 } from "@earendil-works/pi-durable";
 import { BrokerRefusal } from "../broker/broker.ts";
 import { FetchRefused, htmlToText } from "../net/safe-fetch.ts";
 import { channelOf, type NostrEvent } from "../nostr/event.ts";
 import { ThreadDoc } from "../runtime/docs.ts";
-import type { AgentServices } from "./services.ts";
+import { type AgentServices, mayUseWeb } from "./services.ts";
 
 const text = (value: string, isError = false): ToolExecutionResult => ({
   content: [{ type: "text", text: value }],
@@ -118,6 +120,21 @@ export function buzzTools(services: AgentServices) {
   return [readThread, searchMessages];
 }
 
+/**
+ * Whether this conversation may use the web. Only the public domain's
+ * conversations are offered web tools; this check backs that up, so a
+ * misconfigured extension list cannot open a private conversation to the web.
+ */
+async function webAllowed(
+  api: ToolExecutionApi,
+  context: Context,
+): Promise<boolean> {
+  const thread = await api.snapshot(ThreadDoc, api.conversationId, context);
+  return thread !== undefined && mayUseWeb(thread.domain);
+}
+
+const WEB_OFF = "Web access is off in private conversations.";
+
 /** Web tools: fetch is always available; search needs a configured provider. */
 export function webTools(services: AgentServices) {
   const webFetch = defineTool({
@@ -129,9 +146,10 @@ export function webTools(services: AgentServices) {
       maxChars: Type.Optional(Type.Number({ minimum: 500, maximum: 50_000 })),
     }),
     replay: "safe",
-    execute: async (args) => {
+    execute: async (args, api, context) => {
+      if (!(await webAllowed(api, context))) return text(WEB_OFF, true);
       try {
-        const page = await services.fetchPage(args.url);
+        const page = await services.fetchPage(args.url, context.abortSignal);
         if (page.status >= 400)
           return text(`The page returned HTTP ${page.status}.`, true);
         const html = /html/i.test(page.contentType);
@@ -168,9 +186,14 @@ export function webTools(services: AgentServices) {
       count: Type.Optional(Type.Number({ minimum: 1, maximum: 20 })),
     }),
     replay: "safe",
-    execute: async (args) => {
+    execute: async (args, api, context) => {
+      if (!(await webAllowed(api, context))) return text(WEB_OFF, true);
       try {
-        const results = await search.search(args.query, args.count ?? 8);
+        const results = await search.search(
+          args.query,
+          args.count ?? 8,
+          context.abortSignal,
+        );
         if (results.length === 0) return text("No results.");
         return text(
           results

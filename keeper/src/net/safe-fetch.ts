@@ -22,7 +22,10 @@ export type SafeFetchResult = {
 
 export type SafeFetchOptions = {
   readonly maxBytes?: number;
+  /** Longest silence on the socket. */
   readonly timeoutMs?: number;
+  /** Longest one request may take in all, so a server dripping bytes cannot hold it. */
+  readonly deadlineMs?: number;
   readonly maxRedirects?: number;
   readonly signal?: AbortSignal;
 };
@@ -102,7 +105,11 @@ function requestOnce(
 > {
   const maxBytes = options.maxBytes ?? 1_000_000;
   const client = url.protocol === "https:" ? https : http;
-  return new Promise((resolve, reject) => {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<
+    | { result: SafeFetchResult; redirect?: undefined }
+    | { redirect: string; result?: undefined }
+  >((resolve, reject) => {
     const request = client.request(
       url,
       {
@@ -157,8 +164,12 @@ function requestOnce(
     );
     request.on("timeout", () => request.destroy(new FetchRefused("timed out")));
     request.on("error", reject);
+    deadline = setTimeout(
+      () => request.destroy(new FetchRefused("took too long")),
+      options.deadlineMs ?? 30_000,
+    );
     request.end();
-  });
+  }).finally(() => clearTimeout(deadline));
 }
 
 /** Whether an IP address is globally routable; mirrors the relay's deny classes. */

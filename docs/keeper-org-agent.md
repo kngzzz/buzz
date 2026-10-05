@@ -1,7 +1,9 @@
 # Keeper: a durable organizational agent for Buzz
 
 Status: **Draft for discussion** · 2026-10-05 · Working name: *Keeper* (each
-organization picks the display name and avatar)
+organization picks the display name and avatar) · Decided so far: the durable
+research agent ships first (D3), and the code lives in a `keeper/` package in
+this repository (D2)
 
 Builds on:
 [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable)
@@ -20,9 +22,10 @@ Builds on:
 > before it is shown, so a crash or redeploy resumes work instead of losing or
 > repeating it. Keeper never tells anyone something they could not already read
 > in Buzz, and it never publishes private information more widely without a
-> human approving the exact text. It ships in six phases, each useful on its
-> own: foundations, a durable thread teammate, durable research, org memory,
-> workspace management, then scale and governance.
+> human approving the exact text. It ships in phases, each useful on its own.
+> The first product is a durable research agent built on Keeper's
+> foundations; org memory, workspace management, and scale and governance
+> follow.
 
 ## Contents
 
@@ -167,27 +170,27 @@ Each scenario names the phase (§16) that delivers it.
    While it works, Marco writes "use October 20, not the 13th". Keeper picks
    that up after its current step, without starting over. Anyone in the thread
    can say "stop".
-3. **Durable research** (P2). "@Keeper find out what our top five competitors
+3. **Durable research** (P1). "@Keeper find out what our top five competitors
    charge for team plans; report by Friday." Keeper posts a plan, works in the
    background for hours, survives restarts, posts progress, delivers a report
    in the thread, and answers follow-up questions there.
-4. **Remember for the channel** (P3). In channels that opted in, Keeper keeps a
+4. **Remember for the channel** (P2). In channels that opted in, Keeper keeps a
    running tracker of decisions, action items and open questions, each linked
    to its source. Anyone in the channel can confirm, edit or dismiss an item.
-5. **My briefing** (P3). In a DM: "Every weekday at 9, tell me what needs my
+5. **My briefing** (P2). In a DM: "Every weekday at 9, tell me what needs my
    attention." Keeper sends a short briefing drawn only from channels that
    person belongs to.
-6. **Turn talk into tracked work** (P4). After a planning thread Keeper asks:
+6. **Turn talk into tracked work** (P3). After a planning thread Keeper asks:
    "I found three action items — track them?" A ✅ creates the tasks with
    owners and due dates. Keeper reminds owners and reports completion back to
    the thread.
-7. **Automations in plain language** (P4). "Every Monday, post a summary of
+7. **Automations in plain language** (P3). "Every Monday, post a summary of
    `#sales` wins to `#leadership`." Keeper drafts a Buzz workflow, shows it in
    plain words, and has the right person sign it. Each Monday the workflow wakes
    Keeper. If `#sales` is private, its content cannot reach `#leadership`
    unannounced: Keeper asks a `#sales` member to approve each summary before
    posting it (§9.5).
-8. **Delegate to specialist agents** (P4). "Ask the coding agent to fix the
+8. **Delegate to specialist agents** (P3). "Ask the coding agent to fix the
    broken link on the pricing page." Keeper mentions the agent in the right
    channel, tracks the result, and reports back.
 
@@ -374,7 +377,7 @@ must be able to see where Keeper listens.
 | Mode | Behaviour |
 |---|---|
 | `member` (default) | Keeper observes only channels where it is a member. An admin may add it to every open channel. Visible and consent-based. |
-| `open-read` (opt-in) | Keeper observes every open channel without joining, which the relay already permits. Requirements:<ul><li>Keeper announces this once in a workspace-wide channel.</li><li>It answers "where are you listening?"</li><li>The desktop shows an indicator in observed channels (Phase 3).</li><li>New open channels are found by polling kind:39000, because channel metadata is not pushed to global subscriptions.</li></ul> |
+| `open-read` (opt-in) | Keeper observes every open channel without joining, which the relay already permits. Requirements:<ul><li>Keeper announces this once in a workspace-wide channel.</li><li>It answers "where are you listening?"</li><li>The desktop shows an indicator in observed channels (Phase 2).</li><li>New open channels are found by polling kind:39000, because channel metadata is not pushed to global subscriptions.</li></ul> |
 | Opt-outs | Channel admins can set `quiet` or tell Keeper to `leave`. An admin deny list excludes channels entirely. |
 
 ### 6.3 Whom Keeper answers
@@ -942,7 +945,7 @@ approver must be someone who could perform the action manually:
 
 - **Declassification is always exact and single-use**, as the draft requires.
   For other class 2 actions a channel may allow short scoped grants, such as
-  "approve similar posts in this thread for one hour" (Phase 4).
+  "approve similar posts in this thread for one hour" (Phase 3).
 - **Workflow approvals** (kinds 46030/46031) are not wired end to end yet
   (WF-08). Keeper does not depend on them.
 
@@ -962,7 +965,7 @@ Keeper narrows them:
 - MCP servers classified by where their data goes (§11.2);
 - secrets substituted at the egress proxy rather than handed to code.
 
-Integrity labels in the style of FIDES, and complete mediation, are Phase 5
+Integrity labels in the style of FIDES, and complete mediation, are Phase 4
 work.
 
 ---
@@ -1037,7 +1040,7 @@ it is about.
 **The type namespace.** `buzz.*` types are reserved for published Buzz client
 contracts, and `buzz.task` is already NIP-AR's example.
 
-- *Phase 3* agrees schemas for `buzz.decision`, `buzz.task`, `buzz.question`
+- *Phase 2* agrees schemas for `buzz.decision`, `buzz.task`, `buzz.question`
   and `buzz.digest` with the desktop and mobile teams, so every client renders
   them for people, not just for Keeper.
 - *Before that*, prototypes write `keeper.dev.*` types, and only in test
@@ -1327,7 +1330,7 @@ What Buzz offers today, and how Keeper uses it:
    the automation will use must sign it. This generalizes Buzz's existing
    *owner-reviewed draft* pattern, where nothing changes until the owner saves
    the draft (`crates/buzz-cli/src/agent_management.rs`). The desktop needs to
-   accept workflow drafts from Keeper and open them prefilled (Phase 4).
+   accept workflow drafts from Keeper and open them prefilled (Phase 3).
 3. **Waking Keeper.** A `send_message` step that mentions `@Keeper` gets `p`
    and `buzz:workflow-mention` tags from the relay. Keeper treats the message
    as a request from the workflow's owner (§6.3).
@@ -1602,8 +1605,8 @@ do not survive node loss. Keeper is resident, so it needs a different shape:
 
 | Stage | Shape | Scales by |
 |---|---|---|
-| Phases 1–4 | One process per community. All domains in it; idle domains suspended. | One machine. Enough for hundreds of active threads (to be measured in Phase 1). |
-| Phase 5 | A coordinator (gateway, router, broker, scheduler) and domain workers. Domains are assigned by consistent hashing, each with its own lease. | Adding workers |
+| Phases 1–3 | One process per community. All domains in it; idle domains suspended. | One machine. Enough for hundreds of active threads (to be measured in Phase 1). |
+| Phase 4 | A coordinator (gateway, router, broker, scheduler) and domain workers. Domains are assigned by consistent hashing, each with its own lease. | Adding workers |
 | Hosted operators | Many communities. A community's Keeper scales to zero when idle, and the relay's operator listener wakes it. | Process per community |
 
 **The operator listener** is deployment-global. When a kind 9, 40002, 45001 or
@@ -1637,19 +1640,22 @@ uses it to start a suspended Keeper, which then catches up from its cursors.
 
 ## 16. Phased delivery
 
+**Decided (2026-10-05):** the first product is a durable **research agent**
+built on Keeper's foundations. Keeper's organizational features — org memory,
+then workspace management — follow on the same foundations.
+
 Each phase ships something people can use, and each has exit criteria a test
 can check.
 
 | Phase | Name | What people get | What gets built |
 |---|---|---|---|
-| 0 | Foundations | — | Decisions, skeleton, label module, local dev loop |
-| 1 | Durable teammate | Ask Keeper in threads and DMs; steer and stop it; catch-up summaries | Gateway, router, broker v1, domains, outbox, read tools, resident deployment |
-| 2 | Durable research | Long research jobs with reports | Research jobs, MCP, skills, sandboxes, budgets |
-| 3 | Org memory | Channel trackers, briefings, decision capture | Caretakers, ledger on NIP-AR, desktop rendering |
-| 4 | Workspace manager | Tasks, reminders, automations, delegation | Task lifecycle, timers, workflow drafts, approvals v2 |
-| 5 | Scale and govern | Admin experience, packs, hosted scale | Workers, pack review, integrity labels, evals in CI |
+| 0 | Foundations | — | Skeleton, label module, relay client, one durable domain, outbox |
+| 1 | **Research agent** | Ask it in any thread or DM; long research jobs that survive restarts, with progress and a report; steer and stop it | Gateway, router, broker v1, domains, read tools, research jobs, web search and fetch, MCP, budgets, resident deployment |
+| 2 | Keeper: org memory | Channel trackers, briefings, decision capture | Caretakers, ledger on NIP-AR, desktop rendering |
+| 3 | Keeper: workspace manager | Tasks, reminders, automations, delegation, analysis that runs code | Task lifecycle, timers, workflow drafts, approvals v2, sandboxes |
+| 4 | Scale and govern | Admin experience, packs, hosted scale | Workers, pack review, integrity labels, evals in CI |
 
-Why research comes before workspace management:
+Why research comes first:
 
 - Research mostly reads, so its risk is low.
 - It exercises durability fully: long jobs, restarts, background work.
@@ -1659,7 +1665,7 @@ Why research comes before workspace management:
 
 ### Phase 0 — Foundations
 
-**Goal:** settle the decisions in §18 and prove the end-to-end path.
+**Goal:** prove the end-to-end path on the real runtime.
 
 **Scope, roughly in PR order:**
 
@@ -1667,27 +1673,28 @@ Why research comes before workspace management:
    loader and a control store.
 2. Port the label module from `crates/ifc-core`, with JSON fixtures shared by
    the Rust and TypeScript tests.
-3. Gateway v0: NIP-42 auth, one channel subscription, cursor, reconnect.
+3. A relay client: NIP-42 auth, REQ/EOSE/CLOSED, EVENT/OK, reconnect.
 4. One domain harness on SQLite with the pi-ai faux provider, plus the
    `buzz.message` entry and the `keeper.binding` and `keeper.requests`
    documents.
-5. Outbox: deterministic signed replies, memoized, republished on restart.
-6. A local loop: `just relay` and `keeper dev` against it.
+5. Outbox: memoized signed replies, republished on restart.
+6. A local loop: `just relay` and `keeper` against it.
 
 **Exit criteria**
 
 - On a local relay, "@Keeper hello" in a thread produces exactly one reply,
   through gateway → router → domain → outbox.
-- Killing the process at scripted points during that run, then restarting,
-  still yields exactly one reply.
+- Closing the process during that run, then restarting, still yields exactly
+  one reply.
 - The label fixtures pass in both Rust and TypeScript.
 
-### Phase 1 — Durable teammate
+### Phase 1 — Research agent
 
-**Goal:** anyone can ask Keeper in a thread or DM and trust the answer arrives
-once.
+**Goal:** anyone can hand Keeper a research question in a thread or DM and
+trust that the answer arrives once, even if the job takes hours and the
+process restarts in the middle.
 
-**Scope**
+**Milestone 1a — a durable thread agent**
 
 | Area | Work |
 |---|---|
@@ -1697,52 +1704,47 @@ once.
 | Conversations | Thread backfill; attribution; steer and context placement; compaction; idle handoff |
 | Broker v1 | Key custody; read checks; replies only (class 0 tools) |
 | Output | Outbox; 👀, typing and progress messages; `stop` and `status` |
-| Operations | Model-access semaphores; usage tracking; simple budgets; resident deployment with lease and volume |
+
+**Milestone 1b — research jobs**
+
+- The `research` tool and background research conversations (§12.1).
+- `web_search` and `web_fetch` tools: fetch is built in (size-capped, refuses
+  private addresses); search goes through a pluggable provider.
+- The MCP adapter and per-server policy (§11.2).
+- Skills from the config repository (§11.3).
+- Reports in the thread, or as forum posts where forums are enabled; follow-up
+  questions in the thread.
+- Per-job budgets; `stop` reaches the job.
+
+**Milestone 1c — hardening and pilot**
+
+- Model-access semaphores; usage tracking; budgets.
+- Resident deployment with a lease and a persistent volume (§15.1).
+- The crash-injection and information-flow suites (§17).
 
 **Exit criteria**
 
 - **Crash injection.** Across 100 random kill points, no request is lost and
   no reply is duplicated, verified by querying the relay.
-- **Information flow.** The two-world tests for every read tool pass (§17).
+- **Long jobs.** A research job survives a redeploy in the middle of its run
+  and delivers one report.
+- **Information flow.** The two-world tests for every read tool pass (§17). A
+  private-domain job cannot call a server whose `dataEgress` is not allowed
+  there.
+- **Configuration, not code.** Adding an MCP server or a search provider is a
+  configuration change.
 - **Outage.** A request posted while the relay was unreachable for 10 minutes is
   answered after recovery.
-- **Pilot.** A pilot group, including non-technical people, uses Keeper for a
-  week. Keeper acknowledges a request within 2 seconds at the median and shows
-  typing within 3 seconds.
+- **Pilot.** A pilot group, including non-technical people, uses it for a week.
+  It acknowledges a request within 2 seconds at the median and shows typing
+  within 3 seconds.
 
 **Depends on:** nothing in the relay — Keeper is an ordinary member. An
 elevated rate tier is desirable.
 
-**Not in this phase:** listening without a request, memory, sandboxes, MCP.
+**Not in this phase:** listening without a request, memory, sandboxes.
 
-### Phase 2 — Durable research
-
-**Goal:** Keeper takes on long research jobs that survive restarts.
-
-**Scope**
-
-- The `research` tool and background research conversations (§12.1).
-- The MCP adapter and per-server policy (§11.2); web search and fetch servers.
-- Skills from the config repository (§11.3).
-- Sandboxes v1 (§11.4): per-domain workspace; container or micro-VM provider;
-  no inherited environment; egress policy; secrets at egress.
-- Reports in the thread, or as forum posts where forums are enabled; follow-up
-  questions in the thread.
-- Per-job budgets; `stop` reaches the job.
-
-**Exit criteria**
-
-- A research job survives a redeploy in the middle of its run and delivers one
-  report.
-- Adding an MCP server is a change in the config repository, not in code.
-- A private-domain job cannot call a server whose `dataEgress` is not allowed
-  there (test).
-- Sandbox checks pass. The sandbox:
-  - holds none of Keeper's environment variables;
-  - cannot reach the broker;
-  - cannot read another domain's workspace.
-
-### Phase 3 — Org memory and intent
+### Phase 2 — Keeper: org memory
 
 **Goal:** Keeper condenses channels into a visible, correctable tracker.
 
@@ -1761,14 +1763,14 @@ elevated rate tier is desirable.
 
 **Exit criteria**
 
-- Extraction quality on a labeled corpus meets thresholds agreed in Phase 0 —
-  for example, decision precision of at least 0.9 at the "proposed" threshold.
+- Extraction quality on a labeled corpus meets agreed thresholds — for
+  example, decision precision of at least 0.9 at the "proposed" threshold.
 - The information-flow suite covers memory: no record or brief ever reaches a
   domain whose audience it does not cover.
 - **Quiet by default:** an unconfigured channel receives no unprompted messages
   (test).
 
-### Phase 4 — Workspace manager
+### Phase 3 — Keeper: workspace manager
 
 **Goal:** talk turns into tracked work and automations.
 
@@ -1780,6 +1782,8 @@ elevated rate tier is desirable.
 - Workflow drafting with human signing; workflows that wake Keeper (§12.4).
 - Approvals v2: scoped grants, approver policies, an approval digest by DM.
 - Delegation by mention; structured jobs once the relay accepts them (§12.5).
+- Sandboxes (§11.4): per-domain workspace; container or micro-VM provider; no
+  inherited environment; egress policy; secrets at egress.
 - The meeting-notes pack (§12.6).
 
 **Exit criteria**
@@ -1791,11 +1795,13 @@ elevated rate tier is desirable.
   - approval from someone who could not have done the action themselves is
     rejected;
   - expired or reused approvals are rejected.
+- **Sandboxes.** The sandbox holds none of Keeper's environment variables,
+  cannot reach the broker, and cannot read another domain's workspace.
 
 **Depends on:** the desktop accepting Keeper's drafts; optionally WF-07 and
 WF-08 and the job kinds.
 
-### Phase 5 — Scale, govern, extend
+### Phase 4 — Scale, govern, extend
 
 - A coordinator and workers; domain sharding; scale-to-zero through the
   operator listener; hosting many communities (§15.4).
@@ -1837,8 +1843,8 @@ puts it this way: a guard whose removal fails no test protects nothing.
 | # | Decision | Recommendation | Why |
 |---|---|---|---|
 | D1 | Working name | **Keeper**; each organization picks the display name | Unused in Buzz. "Hive" is in the desktop's persona name pool; "steward" means an admin or owner row in relay code. |
-| D2 | Where the code lives | A **`keeper/` TypeScript package in this repository** | It must move in lockstep with kinds, relay limits, information-flow rules and desktop rendering. |
-| D3 | The first flagship after Phase 1 | **Research**, then workspace management | Low risk; exercises durability; not blocked on WF-08 or desktop contracts. |
+| D2 | Where the code lives | **Decided:** a `keeper/` TypeScript package in this repository | It must move in lockstep with kinds, relay limits, information-flow rules and desktop rendering. |
+| D3 | The first product | **Decided:** the durable research agent (Phase 1), then Keeper's organizational features | Low risk; exercises durability; not blocked on WF-08 or desktop contracts. |
 | D4 | Default observation | **`member`** (visible); `open-read` as an opt-in with disclosure | Consent and transparency. |
 | D5 | Hosting | **Resident single instance with a persistent volume**; scale-to-zero later | It has to be always on for timers and listening. |
 | D6 | Memory substrate | **NIP-AR records** with agreed `buzz.*` client contracts | The relay enforces access; people can edit; no new kind is needed. |

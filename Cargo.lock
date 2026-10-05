@@ -4263,6 +4263,7 @@ name = "ifc-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde_json",
 ]
 
 [[package]]

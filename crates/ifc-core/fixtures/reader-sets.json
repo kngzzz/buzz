@@ -1,0 +1,20 @@
+{
+  "description": "Reader-set lattice cases shared by ifc-core and keeper/src/ifc/labels.ts. A reader set is the string \"everyone\" or an array of principals.",
+  "canFlowTo": [
+    { "name": "public flows to public", "source": "everyone", "destination": "everyone", "expected": true },
+    { "name": "public flows to a restricted audience", "source": "everyone", "destination": ["alice"], "expected": true },
+    { "name": "restricted never flows to public", "source": ["alice", "bob"], "destination": "everyone", "expected": false },
+    { "name": "narrowing is allowed", "source": ["alice", "bob"], "destination": ["alice"], "expected": true },
+    { "name": "same audience is allowed", "source": ["alice", "bob"], "destination": ["bob", "alice"], "expected": true },
+    { "name": "widening is refused", "source": ["alice", "bob"], "destination": ["alice", "bob", "carol"], "expected": false },
+    { "name": "disjoint audiences are refused", "source": ["alice", "bob"], "destination": ["alice", "carol"], "expected": false },
+    { "name": "a single reader flows to itself", "source": ["alice"], "destination": ["alice"], "expected": true }
+  ],
+  "join": [
+    { "name": "public adds no restriction", "left": "everyone", "right": ["alice", "bob"], "expected": ["alice", "bob"] },
+    { "name": "public joined with public stays public", "left": "everyone", "right": "everyone", "expected": "everyone" },
+    { "name": "overlapping audiences intersect", "left": ["alice", "bob"], "right": ["alice", "carol"], "expected": ["alice"] },
+    { "name": "disjoint audiences leave no readers", "left": ["alice"], "right": ["bob"], "expected": [] },
+    { "name": "join is commutative", "left": ["alice", "carol"], "right": ["alice", "bob"], "expected": ["alice"] }
+  ]
+}

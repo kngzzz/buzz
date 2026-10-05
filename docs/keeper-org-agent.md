@@ -1655,6 +1655,16 @@ can check.
 | 3 | Keeper: workspace manager | Tasks, reminders, automations, delegation, analysis that runs code | Task lifecycle, timers, workflow drafts, approvals v2, sandboxes |
 | 4 | Scale and govern | Admin experience, packs, hosted scale | Workers, pack review, integrity labels, evals in CI |
 
+**Progress (2026-10-05).** The `keeper/` package implements Phase 0 and most
+of milestones 1a and 1b, verified against a local relay; its
+[README](../keeper/README.md) lists what works. Phase 0's exit criteria hold:
+exactly one reply per mention, also when the process is killed and restarted,
+and the label fixtures pass in Rust and TypeScript. The outbox is a durable
+reply task per request that memoizes its signed events. Still open in Phase 1:
+reconciliation sweeps, NIP-FI-aware reconnect, suspending idle domains, the
+epoch rule on narrowing, compaction, progress messages, MCP, skills, forum
+reports, budgets, and all of 1c.
+
 Why research comes first:
 
 - Research mostly reads, so its risk is low.
